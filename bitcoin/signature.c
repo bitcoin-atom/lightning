@@ -65,11 +65,11 @@ static void dump_tx(const char *msg,
 	}
 }
 #else
-static void dump_tx(const char *msg,
-		    const struct bitcoin_tx *tx, size_t inputnum,
-		    const u8 *script,
-		    const struct pubkey *key,
-		    const struct sha256_double *h)
+static void dump_tx(const char *msg UNUSED,
+		    const struct bitcoin_tx *tx UNUSED, size_t inputnum UNUSED,
+		    const u8 *script UNUSED,
+		    const struct pubkey *key UNUSED,
+		    const struct sha256_double *h UNUSED)
 {
 }
 #endif
@@ -197,7 +197,7 @@ static bool IsValidSignatureEncoding(const unsigned char sig[], size_t len)
 
     // Verify that the length of the signature matches the sum of the length
     // of the elements.
-    if ((size_t)(lenR + lenS + 7) != len) return false;
+    if ((size_t)lenR + (size_t)lenS + 7 != len) return false;
 
     // Check whether the R element is an integer.
     if (sig[2] != 0x02) return false;

@@ -17,21 +17,24 @@
 #include <common/status.h>
 #include <common/type_to_string.h>
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
+  /* Needs to be at end, since it doesn't include its own hdrs */
+  #include "gen_full_channel_error_names.h"
 
-struct channel *new_channel(const tal_t *ctx,
-			    const struct bitcoin_txid *funding_txid,
-			    unsigned int funding_txout,
-			    u64 funding_satoshis,
-			    u64 local_msatoshi,
-			    const u32 feerate_per_kw[NUM_SIDES],
-			    const struct channel_config *local,
-			    const struct channel_config *remote,
-			    const struct basepoints *local_basepoints,
-			    const struct basepoints *remote_basepoints,
-			    const struct pubkey *local_funding_pubkey,
-			    const struct pubkey *remote_funding_pubkey,
-			    enum side funder)
+struct channel *new_full_channel(const tal_t *ctx,
+				 const struct bitcoin_txid *funding_txid,
+				 unsigned int funding_txout,
+				 u64 funding_satoshis,
+				 u64 local_msatoshi,
+				 const u32 feerate_per_kw[NUM_SIDES],
+				 const struct channel_config *local,
+				 const struct channel_config *remote,
+				 const struct basepoints *local_basepoints,
+				 const struct basepoints *remote_basepoints,
+				 const struct pubkey *local_funding_pubkey,
+				 const struct pubkey *remote_funding_pubkey,
+				 enum side funder)
 {
 	struct channel *channel = new_initial_channel(ctx, funding_txid,
 						      funding_txout,
@@ -290,12 +293,10 @@ static enum channel_add_err add_htlc(struct channel *channel,
 				     struct htlc **htlcp,
 				     bool enforce_aggregate_limits)
 {
-	const tal_t *tmpctx = tal_tmpctx(channel);
 	struct htlc *htlc, *old;
 	s64 msat_in_htlcs, fee_msat, balance_msat;
 	enum side sender = htlc_state_owner(state), recipient = !sender;
 	const struct htlc **committed, **adding, **removing;
-	enum channel_add_err e;
 	const struct channel_view *view;
 	size_t i;
 
@@ -314,8 +315,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	 * `cltv_expiry` to greater or equal to 500000000.
 	 */
 	if (!blocks_to_abs_locktime(cltv_expiry, &htlc->expiry)) {
-		e = CHANNEL_ERR_INVALID_EXPIRY;
-		goto out;
+		return CHANNEL_ERR_INVALID_EXPIRY;
 	}
 
 	htlc->rhash = *payment_hash;
@@ -330,10 +330,9 @@ static enum channel_add_err add_htlc(struct channel *channel,
 		    || old->msatoshi != htlc->msatoshi
 		    || old->expiry.locktime != htlc->expiry.locktime
 		    || !structeq(&old->rhash, &htlc->rhash))
-			e = CHANNEL_ERR_DUPLICATE_ID_DIFFERENT;
+			return CHANNEL_ERR_DUPLICATE_ID_DIFFERENT;
 		else
-			e = CHANNEL_ERR_DUPLICATE;
-		goto out;
+			return CHANNEL_ERR_DUPLICATE;
 	}
 
 	/* We're always considering the recipient's view of the channel here */
@@ -346,12 +345,10 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	 * or...
 	 */
 	if (htlc->msatoshi == 0) {
-		e = CHANNEL_ERR_HTLC_BELOW_MINIMUM;
-		goto out;
+		return CHANNEL_ERR_HTLC_BELOW_MINIMUM;
 	}
 	if (htlc->msatoshi < htlc_minimum_msat(channel, recipient)) {
-		e = CHANNEL_ERR_HTLC_BELOW_MINIMUM;
-		goto out;
+		return CHANNEL_ERR_HTLC_BELOW_MINIMUM;
 	}
 
 	/* BOLT #2:
@@ -361,8 +358,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	 * `amount_msat` to zero.
 	 */
 	if (htlc->msatoshi & 0xFFFFFFFF00000000ULL) {
-		e = CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
-		goto out;
+		return CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
 	}
 
 	/* Figure out what receiver will already be committed to. */
@@ -377,8 +373,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	if (enforce_aggregate_limits
 	    && tal_count(committed) - tal_count(removing) + tal_count(adding)
 	    > max_accepted_htlcs(channel, recipient)) {
-		e = CHANNEL_ERR_TOO_MANY_HTLCS;
-		goto out;
+		return CHANNEL_ERR_TOO_MANY_HTLCS;
 	}
 
 	msat_in_htlcs = total_offered_msatoshis(committed, htlc_owner(htlc))
@@ -392,8 +387,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	 * HTLCs to its local commitment transaction */
 	if (enforce_aggregate_limits
 	    && msat_in_htlcs > max_htlc_value_in_flight_msat(channel, recipient)) {
-		e = CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
-		goto out;
+		return CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED;
 	}
 
 	/* BOLT #2:
@@ -443,13 +437,11 @@ static enum channel_add_err add_htlc(struct channel *channel,
 			     ", reserve is %"PRIu64,
 			     balance_msat, fee_msat,
 			     channel_reserve_msat(channel, sender));
-		e = CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
-		goto out;
+		return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 	}
 
 	dump_htlc(htlc, "NEW:");
 	htlc_map_add(channel->htlcs, tal_steal(channel, htlc));
-	e = CHANNEL_ERR_ADD_OK;
 	if (htlcp)
 		*htlcp = htlc;
 
@@ -460,9 +452,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	if (htlc_state_flags(htlc->state) & HTLC_REMOTE_F_PENDING)
 		channel->changes_pending[REMOTE] = true;
 
-out:
-	tal_free(tmpctx);
-	return e;
+	return CHANNEL_ERR_ADD_OK;
 }
 
 enum channel_add_err channel_add_htlc(struct channel *channel,
@@ -691,14 +681,12 @@ u32 approx_max_feerate(const struct channel *channel)
 	size_t num;
 	u64 weight;
 	const struct htlc **committed, **adding, **removing;
-	const tal_t *tmpctx = tal_tmpctx(channel);
 
 	gather_htlcs(tmpctx, channel, !channel->funder,
 		     &committed, &removing, &adding);
 
 	/* Assume none are trimmed; this gives lower bound on feerate. */
 	num = tal_count(committed) + tal_count(adding) - tal_count(removing);
-	tal_free(tmpctx);
 
 	weight = 724 + 172 * num;
 
@@ -711,8 +699,6 @@ bool can_funder_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 	u64 fee_msat, dust = dust_limit_satoshis(channel, !channel->funder);
 	size_t untrimmed;
 	const struct htlc **committed, **adding, **removing;
-	const tal_t *tmpctx = tal_tmpctx(channel);
-
 	gather_htlcs(tmpctx, channel, !channel->funder,
 		     &committed, &removing, &adding);
 
@@ -724,8 +710,6 @@ bool can_funder_afford_feerate(const struct channel *channel, u32 feerate_per_kw
 						  !channel->funder);
 
 	fee_msat = commit_tx_base_fee(feerate_per_kw, untrimmed);
-
-	tal_free(tmpctx);
 
 	/* BOLT #2:
 	 *
@@ -861,19 +845,20 @@ bool channel_sending_revoke_and_ack(struct channel *channel)
 	return channel->changes_pending[REMOTE];
 }
 
-bool channel_has_htlcs(const struct channel *channel)
+size_t num_channel_htlcs(const struct channel *channel)
 {
 	struct htlc_map_iter it;
 	const struct htlc *htlc;
+	size_t n = 0;
 
 	for (htlc = htlc_map_first(channel->htlcs, &it);
 	     htlc;
 	     htlc = htlc_map_next(channel->htlcs, &it)) {
 		/* FIXME: Clean these out! */
 		if (!htlc_is_dead(htlc))
-			return true;
+			n++;
 	}
-	return false;
+	return n;
 }
 
 static bool adjust_balance(struct channel *channel, struct htlc *htlc)
@@ -918,7 +903,7 @@ bool channel_force_htlcs(struct channel *channel,
 			 const enum htlc_state *hstates,
 			 const struct fulfilled_htlc *fulfilled,
 			 const enum side *fulfilled_sides,
-			 const struct failed_htlc *failed,
+			 const struct failed_htlc **failed,
 			 const enum side *failed_sides)
 {
 	size_t i;
@@ -950,7 +935,7 @@ bool channel_force_htlcs(struct channel *channel,
 			     i, tal_count(htlcs),
 			     htlcs[i].id, htlcs[i].amount_msat,
 			     htlcs[i].cltv_expiry,
-			     type_to_string(trc, struct sha256,
+			     type_to_string(tmpctx, struct sha256,
 					    &htlcs[i].payment_hash));
 
 		e = add_htlc(channel, hstates[i],
@@ -1002,29 +987,29 @@ bool channel_force_htlcs(struct channel *channel,
 	for (i = 0; i < tal_count(failed); i++) {
 		struct htlc *htlc;
 		htlc = channel_get_htlc(channel, failed_sides[i],
-					failed[i].id);
+					failed[i]->id);
 		if (!htlc) {
 			status_trace("Fail %s HTLC %"PRIu64" not found",
 				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i].id);
+				     failed[i]->id);
 			return false;
 		}
 		if (htlc->r) {
 			status_trace("Fail %s HTLC %"PRIu64" already fulfilled",
 				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i].id);
+				     failed[i]->id);
 			return false;
 		}
 		if (htlc->fail) {
 			status_trace("Fail %s HTLC %"PRIu64" already failed",
 				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i].id);
+				     failed[i]->id);
 			return false;
 		}
 		if (htlc->malformed) {
 			status_trace("Fail %s HTLC %"PRIu64" already malformed",
 				     failed_sides[i] == LOCAL ? "out" : "in",
-				     failed[i].id);
+				     failed[i]->id);
 			return false;
 		}
 		if (!htlc_has(htlc, HTLC_REMOVING)) {
@@ -1034,11 +1019,12 @@ bool channel_force_htlcs(struct channel *channel,
 				     htlc_state_name(htlc->state));
 			return false;
 		}
-		if (failed[i].malformed)
-			htlc->malformed = failed[i].malformed;
+		if (failed[i]->malformed)
+			htlc->malformed = failed[i]->malformed;
 		else
-			htlc->fail = tal_dup_arr(htlc, u8, failed[i].failreason,
-						 tal_len(failed[i].failreason),
+			htlc->fail = tal_dup_arr(htlc, u8,
+						 failed[i]->failreason,
+						 tal_len(failed[i]->failreason),
 						 0);
 	}
 
@@ -1053,4 +1039,28 @@ bool channel_force_htlcs(struct channel *channel,
 	}
 
 	return true;
+}
+
+const char *channel_add_err_name(enum channel_add_err e)
+{
+	static char invalidbuf[sizeof("INVALID ") + STR_MAX_CHARS(e)];
+
+	for (size_t i = 0; enum_channel_add_err_names[i].name; i++) {
+		if (enum_channel_add_err_names[i].v == e)
+			return enum_channel_add_err_names[i].name;
+	}
+	sprintf(invalidbuf, "INVALID %i", e);
+	return invalidbuf;
+}
+
+const char *channel_remove_err_name(enum channel_remove_err e)
+{
+	static char invalidbuf[sizeof("INVALID ") + STR_MAX_CHARS(e)];
+
+	for (size_t i = 0; enum_channel_remove_err_names[i].name; i++) {
+		if (enum_channel_remove_err_names[i].v == e)
+			return enum_channel_remove_err_names[i].name;
+	}
+	sprintf(invalidbuf, "INVALID %i", e);
+	return invalidbuf;
 }

@@ -3,11 +3,12 @@
 #define LIGHTNING_LIGHTNINGD_CHANNEL_FULL_CHANNEL_H
 #include "config.h"
 #include <channeld/channeld_htlc.h>
+#include <channeld/full_channel_error.h>
 #include <common/initial_channel.h>
 #include <common/sphinx.h>
 
 /**
- * new_channel: Given initial fees and funding, what is initial state?
+ * new_full_channel: Given initial fees and funding, what is initial state?
  * @ctx: tal context to allocate return value from.
  * @funding_txid: The commitment transaction id.
  * @funding_txout: The commitment transaction output number.
@@ -25,19 +26,19 @@
  *
  * Returns state, or NULL if malformed.
  */
-struct channel *new_channel(const tal_t *ctx,
-			    const struct bitcoin_txid *funding_txid,
-			    unsigned int funding_txout,
-			    u64 funding_satoshis,
-			    u64 local_msatoshi,
-			    const u32 feerate_per_kw[NUM_SIDES],
-			    const struct channel_config *local,
-			    const struct channel_config *remote,
-			    const struct basepoints *local_basepoints,
-			    const struct basepoints *remote_basepoints,
-			    const struct pubkey *local_funding_pubkey,
-			    const struct pubkey *remote_funding_pubkey,
-			    enum side funder);
+struct channel *new_full_channel(const tal_t *ctx,
+				 const struct bitcoin_txid *funding_txid,
+				 unsigned int funding_txout,
+				 u64 funding_satoshis,
+				 u64 local_msatoshi,
+				 const u32 feerate_per_kw[NUM_SIDES],
+				 const struct channel_config *local,
+				 const struct channel_config *remote,
+				 const struct basepoints *local_basepoints,
+				 const struct basepoints *remote_basepoints,
+				 const struct pubkey *local_funding_pubkey,
+				 const struct pubkey *remote_funding_pubkey,
+				 enum side funder);
 
 /**
  * channel_txs: Get the current commitment and htlc txs for the channel.
@@ -77,25 +78,6 @@ struct bitcoin_tx **channel_txs(const tal_t *ctx,
 u32 actual_feerate(const struct channel *channel,
 		   const struct signature *theirsig);
 
-enum channel_add_err {
-	/* All OK! */
-	CHANNEL_ERR_ADD_OK,
-	/* Bad expiry value */
-	CHANNEL_ERR_INVALID_EXPIRY,
-	/* Not really a failure, if expected: it's an exact duplicate. */
-	CHANNEL_ERR_DUPLICATE,
-	/* Same ID, but otherwise different. */
-	CHANNEL_ERR_DUPLICATE_ID_DIFFERENT,
-	/* Would exceed the specified max_htlc_value_in_flight_msat */
-	CHANNEL_ERR_MAX_HTLC_VALUE_EXCEEDED,
-	/* Can't afford it */
-	CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED,
-	/* HTLC is below htlc_minimum_msat */
-	CHANNEL_ERR_HTLC_BELOW_MINIMUM,
-	/* HTLC would push past max_accepted_htlcs */
-	CHANNEL_ERR_TOO_MANY_HTLCS,
-};
-
 /**
  * channel_add_htlc: append an HTLC to channel if it can afford it
  * @channel: The channel
@@ -105,7 +87,7 @@ enum channel_add_err {
  * @cltv_expiry: block number when HTLC can no longer be redeemed.
  * @payment_hash: hash whose preimage can redeem HTLC.
  * @routing: routing information (copied)
- * @htlcp: optional pointer for resulting htlc: filled in iff CHANNEL_ERR_NONE.
+ * @htlcp: optional pointer for resulting htlc: filled in if and only if CHANNEL_ERR_NONE.
  *
  * If this returns CHANNEL_ERR_NONE, the fee htlc was added and
  * the output amounts adjusted accordingly.  Otherwise nothing
@@ -128,27 +110,12 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
  */
 struct htlc *channel_get_htlc(struct channel *channel, enum side sender, u64 id);
 
-enum channel_remove_err {
-	/* All OK! */
-	CHANNEL_ERR_REMOVE_OK,
-	/* No such HTLC. */
-	CHANNEL_ERR_NO_SUCH_ID,
-	/* Already have fulfilled it */
-	CHANNEL_ERR_ALREADY_FULFILLED,
-	/* Preimage doesn't hash to value. */
-	CHANNEL_ERR_BAD_PREIMAGE,
-	/* HTLC is not committed */
-	CHANNEL_ERR_HTLC_UNCOMMITTED,
-	/* HTLC is not committed and prior revoked on both sides */
-	CHANNEL_ERR_HTLC_NOT_IRREVOCABLE
-};
-
 /**
  * channel_fail_htlc: remove an HTLC, funds to the side which offered it.
  * @channel: The channel state
  * @owner: the side who offered the HTLC (opposite to that failing it)
  * @id: unique HTLC id.
- * @htlcp: optional pointer for failed htlc: filled in iff CHANNEL_ERR_REMOVE_OK.
+ * @htlcp: optional pointer for failed htlc: filled in if and only if CHANNEL_ERR_REMOVE_OK.
  *
  * This will remove the htlc and credit the value of the HTLC (back)
  * to its offerer.
@@ -246,10 +213,10 @@ bool channel_rcvd_commit(struct channel *channel,
 bool channel_sending_revoke_and_ack(struct channel *channel);
 
 /**
- * channel_has_htlcs: are there any (live) HTLCs at all in channel?
+ * num_channel_htlcs: how many (live) HTLCs at all in channel?
  * @channel: the channel
  */
-bool channel_has_htlcs(const struct channel *channel);
+size_t num_channel_htlcs(const struct channel *channel);
 
 /**
  * channel_force_htlcs: force these htlcs into the (new) channel
@@ -268,7 +235,7 @@ bool channel_force_htlcs(struct channel *channel,
 			 const enum htlc_state *hstates,
 			 const struct fulfilled_htlc *fulfilled,
 			 const enum side *fulfilled_sides,
-			 const struct failed_htlc *failed,
+			 const struct failed_htlc **failed,
 			 const enum side *failed_sides);
 
 /**
@@ -279,4 +246,8 @@ bool channel_force_htlcs(struct channel *channel,
  * Uses status_trace() on every HTLC.
  */
 void dump_htlcs(const struct channel *channel, const char *prefix);
+
+const char *channel_add_err_name(enum channel_add_err e);
+const char *channel_remove_err_name(enum channel_remove_err e);
+
 #endif /* LIGHTNING_LIGHTNINGD_CHANNEL_FULL_CHANNEL_H */

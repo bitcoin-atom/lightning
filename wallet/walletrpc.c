@@ -13,9 +13,11 @@
 #include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/hsm_control.h>
+#include <lightningd/json.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/log.h>
+#include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
 #include <wally_bip32.h>
 #include <wire/wire_sync.h>
@@ -38,7 +40,7 @@ struct withdrawal {
  * the used outputs as spent, and add the change output to our pool of
  * available outputs.
  */
-static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind,
+static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind UNUSED,
 					int exitstatus, const char *msg,
 					struct withdrawal *withdraw)
 {
@@ -57,8 +59,11 @@ static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind,
 		 * generated the hex tx, so this should always work */
 		tx = bitcoin_tx_from_hex(withdraw, withdraw->hextx, strlen(withdraw->hextx));
 		assert(tx != NULL);
-		wallet_extract_owned_outputs(ld->wallet, tx, &change_satoshi);
-		assert(change_satoshi == withdraw->changesatoshi);
+		wallet_extract_owned_outputs(ld->wallet, tx, NULL, &change_satoshi);
+
+		/* Note normally, change_satoshi == withdraw->changesatoshi, but
+		 * not if we're actually making a payment to ourselves! */
+		assert(change_satoshi >= withdraw->changesatoshi);
 
 		struct json_result *response = new_json_result(cmd);
 		json_object_start(response, NULL);
@@ -69,113 +74,6 @@ static void wallet_withdrawal_broadcast(struct bitcoind *bitcoind,
 	} else {
 		command_fail(cmd, "Error broadcasting transaction: %s", output);
 	}
-}
-
-/**
- * segwit_addr_net_decode - Try to decode a Bech32 address and detect
- * testnet/mainnet
- *
- * This processes the address and returns true if it is a Bech32
- * address specified by BIP173. If it returns true, then *testnet is
- * set whether it is testnet "tb" address or false if mainnet "bc"
- * address. It does not check, witness version and program size
- * restrictions.
- *
- *  Out: testnet:  Pointer to a bool that will be updated to true if the
- *                 address is testnet, or false if mainnet.
- *       witness_version: Pointer to an int that will be updated to contain
- *                 the witness program version (between 0 and 16 inclusive).
- *       witness_program: Pointer to a buffer of size 40 that will be updated
- *                 to contain the witness program bytes.
- *       witness_program_len: Pointer to a size_t that will be updated to
- *                 contain the length of bytes in witness_program.
- *  In:  addrz:    Pointer to the null-terminated address.
- *  Returns true if successful, false if fail (on fail, none of the out
- *  parameters are modified).
- */
-static bool segwit_addr_net_decode(bool *testnet, int *witness_version,
-				   uint8_t *witness_program,
-				   size_t *witness_program_len,
-				   const char *addrz)
-{
-	/* segwit_addr_decode itself expects a prog buffer (which we pass
-	 * witness_program as) of size 40, so segwit_addr_net_decode
-	 * inherits that requirement. It will not write to that buffer
-	 * if the input address is too long, so no buffer overflow risk. */
-	if (segwit_addr_decode(witness_version,
-			       witness_program, witness_program_len,
-			       "bc", addrz)) {
-		*testnet = false;
-		return true;
-	} else if (segwit_addr_decode(witness_version,
-				      witness_program, witness_program_len,
-				      "tb", addrz)) {
-		*testnet = true;
-		return true;
-	}
-	return false;
-}
-
-/**
- * scriptpubkey_from_address - Determine scriptpubkey from a given address
- *
- * This processes the address and returns the equivalent scriptpubkey
- * for the address. If fail to parse the address, return NULL. If can
- * parse address, also sets the testnet flag if address is a testnet
- * address or clears it if mainnet.
- */
-static u8 *scriptpubkey_from_address(const tal_t *cxt, bool *testnet,
-				     const char *addr, size_t addrlen)
-{
-	struct bitcoin_address p2pkh_destination;
-	struct ripemd160 p2sh_destination;
-	int witness_version;
-	/* segwit_addr_net_decode requires a buffer of size 40, and will
-	 * not write to the buffer if the address is too long, so a buffer
-	 * of fixed size 40 will not overflow. */
-	uint8_t witness_program[40];
-	size_t witness_program_len;
-	bool witness_ok;
-	u8 *script = NULL;
-
-	char *addrz;
-	bool my_testnet;
-
-	if (bitcoin_from_base58(testnet, &p2pkh_destination,
-				addr, addrlen)) {
-		script = scriptpubkey_p2pkh(cxt, &p2pkh_destination);
-	} else if (p2sh_from_base58(testnet, &p2sh_destination,
-				    addr, addrlen)) {
-		script = scriptpubkey_p2sh_hash(cxt, &p2sh_destination);
-	}
-	/* Insert other parsers that accept pointer+len here. */
-
-	if (script) return script;
-
-	/* Generate null-terminated address. */
-	addrz = tal_dup_arr(cxt, char, addr, addrlen, 1);
-	addrz[addrlen] = '\0';
-
-	if (segwit_addr_net_decode(&my_testnet, &witness_version,
-				   witness_program, &witness_program_len,
-				   addrz)) {
-		witness_ok = false;
-		if (witness_version == 0 && (witness_program_len == 20 ||
-					     witness_program_len == 32)) {
-			witness_ok = true;
-		}
-		/* Insert other witness versions here. */
-		if (witness_ok) {
-			*testnet = my_testnet;
-			script = scriptpubkey_witness_raw(cxt, witness_version,
-							  witness_program,
-							  witness_program_len);
-		}
-	}
-	/* Insert other parsers that accept null-terminated string here. */
-
-	tal_free(addrz);
-	return script;
 }
 
 /**
@@ -190,21 +88,16 @@ static void json_withdraw(struct command *cmd,
 {
 	jsmntok_t *desttok, *sattok;
 	struct withdrawal *withdraw;
-	bool testnet;
 	u32 feerate_per_kw = get_feerate(cmd->ld->topology, FEERATE_NORMAL);
 	u64 fee_estimate;
-	struct utxo *utxos;
-	struct ext_key ext;
-	struct pubkey changekey;
-	secp256k1_ecdsa_signature *sigs;
 	struct bitcoin_tx *tx;
-	bool withdraw_all = false;
+	bool all_funds = false;
+	enum address_parse_result addr_parse;
 
-	if (!json_get_params(buffer, params,
+	if (!json_get_params(cmd, buffer, params,
 			     "destination", &desttok,
 			     "satoshi", &sattok,
 			     NULL)) {
-		command_fail(cmd, "Need destination and satoshi.");
 		return;
 	}
 
@@ -212,38 +105,34 @@ static void json_withdraw(struct command *cmd,
 	withdraw->cmd = cmd;
 
 	if (json_tok_streq(buffer, sattok, "all"))
-		withdraw_all = true;
+		all_funds = true;
 	else if (!json_tok_u64(buffer, sattok, &withdraw->amount)) {
 		command_fail(cmd, "Invalid satoshis");
 		return;
 	}
 
 	/* Parse address. */
-	withdraw->destination
-		= scriptpubkey_from_address(withdraw, &testnet,
-					    buffer + desttok->start,
-					    desttok->end - desttok->start);
+	addr_parse = json_tok_address_scriptpubkey(cmd,
+						   get_chainparams(cmd->ld),
+						   buffer, desttok,
+						   (const u8**)(&withdraw->destination));
 
 	/* Check that destination address could be understood. */
-	if (!withdraw->destination) {
+	if (addr_parse == ADDRESS_PARSE_UNRECOGNIZED) {
 		command_fail(cmd, "Could not parse destination address");
 		return;
 	}
 
 	/* Check address given is compatible with the chain we are on. */
-	if (testnet != get_chainparams(cmd->ld)->testnet) {
-		if (testnet) {
-			command_fail(cmd,
-				    "Use of testnet address on mainnet");
-		} else {
-			command_fail(cmd,
-				    "Use of mainnet address on testnet");
-		}
+	if (addr_parse == ADDRESS_PARSE_WRONG_NETWORK) {
+		command_fail(cmd,
+			    "Destination address is not on network %s",
+			    get_chainparams(cmd->ld)->network_name);
 		return;
 	}
 
 	/* Select the coins */
-	if (withdraw_all) {
+	if (all_funds) {
 		withdraw->utxos = wallet_select_all(cmd, cmd->ld->wallet,
 						    feerate_per_kw,
 						    tal_len(withdraw->destination),
@@ -278,14 +167,12 @@ static void json_withdraw(struct command *cmd,
 	else
 		withdraw->change_key_index = 0;
 
-	utxos = from_utxoptr_arr(withdraw, withdraw->utxos);
 	u8 *msg = towire_hsm_sign_withdrawal(cmd,
 					     withdraw->amount,
 					     withdraw->changesatoshi,
 					     withdraw->change_key_index,
 					     withdraw->destination,
-					     utxos);
-	tal_free(utxos);
+					     withdraw->utxos);
 
 	if (!wire_sync_write(cmd->ld->hsm_fd, take(msg)))
 		fatal("Could not write sign_withdrawal to HSM: %s",
@@ -293,42 +180,9 @@ static void json_withdraw(struct command *cmd,
 
 	msg = hsm_sync_read(cmd, cmd->ld);
 
-	if (!fromwire_hsm_sign_withdrawal_reply(withdraw, msg, NULL, &sigs))
+	if (!fromwire_hsm_sign_withdrawal_reply(msg, msg, &tx))
 		fatal("HSM gave bad sign_withdrawal_reply %s",
 		      tal_hex(withdraw, msg));
-
-	if (withdraw->changesatoshi) {
-		if (bip32_key_from_parent(cmd->ld->wallet->bip32_base,
-					  withdraw->change_key_index,
-					  BIP32_FLAG_KEY_PUBLIC, &ext)
-		    != WALLY_OK) {
-			command_fail(cmd, "Changekey generation failure");
-			return;
-		}
-
-		pubkey_from_der(ext.pub_key, sizeof(ext.pub_key), &changekey);
-	}
-	tx = withdraw_tx(withdraw, withdraw->utxos, withdraw->destination,
-			 withdraw->amount, &changekey, withdraw->changesatoshi,
-			 cmd->ld->wallet->bip32_base);
-
-	if (tal_count(sigs) != tal_count(tx->input))
-		fatal("HSM gave %zu sigs, needed %zu",
-		      tal_count(sigs), tal_count(tx->input));
-
-	/* Create input parts from signatures. */
-	for (size_t i = 0; i < tal_count(tx->input); i++) {
-		struct pubkey key;
-
-		if (!bip32_pubkey(cmd->ld->wallet->bip32_base,
-				  &key, withdraw->utxos[i]->keyindex))
-			fatal("Cannot generate BIP32 key for UTXO %u",
-			      withdraw->utxos[i]->keyindex);
-
-		/* P2SH inputs have same witness. */
-		tx->input[i].witness
-			= bitcoin_witness_p2wpkh(tx, &sigs[i], &key);
-	}
 
 	/* Now broadcast the transaction */
 	withdraw->hextx = tal_hex(withdraw, linearize_tx(cmd, tx));
@@ -340,21 +194,41 @@ static void json_withdraw(struct command *cmd,
 static const struct json_command withdraw_command = {
 	"withdraw",
 	json_withdraw,
-	"Send {satoshi} (or 'all') to the {destination} address via Bitcoin transaction",
-	"Returns the withdrawal transaction ID"
+	"Send to {destination} address {satoshi} (or 'all') amount via Bitcoin transaction",
+	false, "Send funds from the internal wallet to the specified address. Either specify a number of satoshis to send or 'all' to sweep all funds in the internal wallet to the address."
 };
 AUTODATA(json_command, &withdraw_command);
 
-static void json_newaddr(struct command *cmd,
-			 const char *buffer, const jsmntok_t *params)
+static void json_newaddr(struct command *cmd, const char *buffer UNUSED,
+			 const jsmntok_t *params UNUSED)
 {
 	struct json_result *response = new_json_result(cmd);
 	struct ext_key ext;
 	struct sha256 h;
-	struct ripemd160 p2sh;
+	struct ripemd160 h160;
 	struct pubkey pubkey;
+	jsmntok_t *addrtype;
 	u8 *redeemscript;
+	bool is_p2wpkh, ok;
 	s64 keyidx;
+	char *out;
+	const char *hrp;
+
+	if (!json_get_params(cmd, buffer, params,
+			     "?addresstype", &addrtype, NULL)) {
+		return;
+	}
+
+	if (!addrtype || json_tok_streq(buffer, addrtype, "p2sh-segwit"))
+		is_p2wpkh = false;
+	else if (json_tok_streq(buffer, addrtype, "bech32"))
+		is_p2wpkh = true;
+	else {
+		command_fail(cmd,
+			     "Invalid address type "
+			     "(expected bech32 or p2sh-segwit)");
+		return;
+	}
 
 	keyidx = wallet_get_newindex(cmd->ld);
 	if (keyidx < 0) {
@@ -376,14 +250,27 @@ static void json_newaddr(struct command *cmd,
 
 	txfilter_add_derkey(cmd->ld->owned_txfilter, ext.pub_key);
 
-	redeemscript = bitcoin_redeem_p2sh_p2wpkh(cmd, &pubkey);
-	sha256(&h, redeemscript, tal_count(redeemscript));
-	ripemd160(&p2sh, h.u.u8, sizeof(h));
+	if (is_p2wpkh) {
+		hrp = get_chainparams(cmd->ld)->bip173_name;
+		/* out buffer is 73 + strlen(human readable part). see bech32.h */
+		out = tal_arr(cmd, char, 73 + strlen(hrp));
+		pubkey_to_hash160(&pubkey, &h160);
+		ok = segwit_addr_encode(out, hrp, 0, h160.u.u8, sizeof(h160.u.u8));
+		if (!ok) {
+			command_fail(cmd, "p2wpkh address encoding failure.");
+			return;
+		}
+	}
+	else {
+		redeemscript = bitcoin_redeem_p2sh_p2wpkh(cmd, &pubkey);
+		sha256(&h, redeemscript, tal_count(redeemscript));
+		ripemd160(&h160, h.u.u8, sizeof(h));
+		out = p2sh_to_base58(cmd,
+				     get_chainparams(cmd->ld)->testnet, &h160);
+	}
 
 	json_object_start(response, NULL);
-	json_add_string(response, "address",
-			p2sh_to_base58(cmd, get_chainparams(cmd->ld)->testnet,
-				       &p2sh));
+	json_add_string(response, "address", out);
 	json_object_end(response);
 	command_success(cmd, response);
 }
@@ -391,74 +278,83 @@ static void json_newaddr(struct command *cmd,
 static const struct json_command newaddr_command = {
 	"newaddr",
 	json_newaddr,
-	"Get a new address to fund a channel",
-	"Returns {address} a p2sh address"
+	"Get a new {bech32, p2sh-segwit} address to fund a channel", false,
+	"Generates a new address that belongs to the internal wallet. Funds sent to these addresses will be managed by lightningd. Use `withdraw` to withdraw funds to an external wallet."
 };
 AUTODATA(json_command, &newaddr_command);
 
-static void json_addfunds(struct command *cmd,
-			  const char *buffer, const jsmntok_t *params)
+static void json_listaddrs(struct command *cmd,
+						   const char *buffer, const jsmntok_t *params)
 {
 	struct json_result *response = new_json_result(cmd);
-	jsmntok_t *txtok;
-	struct bitcoin_tx *tx;
-	size_t txhexlen;
-	int num_utxos = 0;
-	u64 total_satoshi = 0;
+	struct ext_key ext;
+	struct sha256 h;
+	struct ripemd160 h160;
+	struct pubkey pubkey;
+	jsmntok_t *bip32tok;
+	u8 *redeemscript;
+	bool ok;
+	char *out_p2sh;
+	char *out_p2wpkh;
+	const char *hrp;
+	u64 bip32_max_index;
 
-	if (!json_get_params(buffer, params, "tx", &txtok, NULL)) {
-		command_fail(cmd, "Need tx sending to address from newaddr");
+	if (!json_get_params(cmd, buffer, params,
+			     "?bip32_max_index", &bip32tok,
+			     NULL)) {
 		return;
 	}
 
-	txhexlen = txtok->end - txtok->start;
-	tx = bitcoin_tx_from_hex(cmd, buffer + txtok->start, txhexlen);
-	if (!tx) {
-		command_fail(cmd, "'%.*s' is not a valid transaction",
-			     txtok->end - txtok->start,
-			     buffer + txtok->start);
-		return;
+	if (!bip32tok || !json_tok_u64(buffer, bip32tok, &bip32_max_index)) {
+		bip32_max_index = db_get_intvar(cmd->ld->wallet->db, "bip32_max_index", 0);
 	}
-
-	/* Find an output we know how to spend. */
-	num_utxos =
-	    wallet_extract_owned_outputs(cmd->ld->wallet, tx, &total_satoshi);
-	if (num_utxos < 0) {
-		command_fail(cmd, "Could not add outputs to wallet");
-		return;
-	} else if (!num_utxos) {
-		command_fail(cmd, "No usable outputs");
-		return;
-	}
-
 	json_object_start(response, NULL);
-	json_add_num(response, "outputs", num_utxos);
-	json_add_u64(response, "satoshis", total_satoshi);
-	json_object_end(response);
-	command_success(cmd, response);
-}
+	json_array_start(response, "addresses");
 
-static const struct json_command addfunds_command = {
-	"addfunds",
-	json_addfunds,
-	"Add funds for lightningd to spend to create channels, using {tx}",
-	"Returns how many {outputs} it can use and total {satoshis}"
-};
-AUTODATA(json_command, &addfunds_command);
+	for (s64 keyidx = 0; keyidx <= bip32_max_index; keyidx++) {
 
-static void json_listfunds(struct command *cmd, const char *buffer,
-			   const jsmntok_t *params)
-{
-	struct json_result *response = new_json_result(cmd);
-	struct utxo **utxos =
-	    wallet_get_utxos(cmd, cmd->ld->wallet, output_state_available);
-	json_object_start(response, NULL);
-	json_array_start(response, "outputs");
-	for (int i = 0; i < tal_count(utxos); i++) {
+		if(keyidx == BIP32_INITIAL_HARDENED_CHILD){
+			break;
+		}
+
+		if (bip32_key_from_parent(cmd->ld->wallet->bip32_base, keyidx,
+					  BIP32_FLAG_KEY_PUBLIC, &ext) != WALLY_OK) {
+			command_fail(cmd, "Keys generation failure");
+			return;
+		}
+
+		if (!secp256k1_ec_pubkey_parse(secp256k1_ctx, &pubkey.pubkey,
+					       ext.pub_key, sizeof(ext.pub_key))) {
+			command_fail(cmd, "Key parsing failure");
+			return;
+		}
+
+		// p2sh
+		redeemscript = bitcoin_redeem_p2sh_p2wpkh(cmd, &pubkey);
+		sha256(&h, redeemscript, tal_count(redeemscript));
+		ripemd160(&h160, h.u.u8, sizeof(h));
+		out_p2sh = p2sh_to_base58(cmd,
+								  get_chainparams(cmd->ld)->testnet, &h160);
+
+		// bech32 : p2wpkh
+		hrp = get_chainparams(cmd->ld)->bip173_name;
+		/* out buffer is 73 + strlen(human readable part). see bech32.h */
+		out_p2wpkh = tal_arr(cmd, char, 73 + strlen(hrp));
+		pubkey_to_hash160(&pubkey, &h160);
+		ok = segwit_addr_encode(out_p2wpkh, hrp, 0, h160.u.u8, sizeof(h160.u.u8));
+		if (!ok) {
+			command_fail(cmd, "p2wpkh address encoding failure.");
+			return;
+		}
+
+		// outputs
 		json_object_start(response, NULL);
-		json_add_txid(response, "txid", &utxos[i]->txid);
-		json_add_num(response, "output", utxos[i]->outnum);
-		json_add_u64(response, "value", utxos[i]->amount);
+		json_add_u64(response, "keyidx", keyidx);
+		json_add_pubkey(response, "pubkey", &pubkey);
+		json_add_string(response, "p2sh", out_p2sh);
+		json_add_hex(response, "p2sh_redeemscript", redeemscript, tal_count(redeemscript));
+		json_add_string(response, "bech32", out_p2wpkh);
+		json_add_hex(response, "bech32_redeemscript", &h160.u.u8, sizeof(struct ripemd160));
 		json_object_end(response);
 	}
 	json_array_end(response);
@@ -466,8 +362,144 @@ static void json_listfunds(struct command *cmd, const char *buffer,
 	command_success(cmd, response);
 }
 
+static const struct json_command listaddrs_command = {
+	"dev-listaddrs",
+	json_listaddrs,
+	"Show addresses list up to derivation {index} (default is the last bip32 index)", false,
+	"Show addresses of your internal wallet. Use `newaddr` to generate a new address."
+};
+AUTODATA(json_command, &listaddrs_command);
+
+static void json_listfunds(struct command *cmd, const char *buffer UNUSED,
+			   const jsmntok_t *params UNUSED)
+{
+	struct json_result *response = new_json_result(cmd);
+	struct peer *p;
+	struct utxo **utxos =
+	    wallet_get_utxos(cmd, cmd->ld->wallet, output_state_available);
+	json_object_start(response, NULL);
+	json_array_start(response, "outputs");
+	for (size_t i = 0; i < tal_count(utxos); i++) {
+		json_object_start(response, NULL);
+		json_add_txid(response, "txid", &utxos[i]->txid);
+		json_add_num(response, "output", utxos[i]->outnum);
+		json_add_u64(response, "value", utxos[i]->amount);
+
+		if (utxos[i]->spendheight)
+			json_add_string(response, "status", "spent");
+		else if (utxos[i]->blockheight)
+			json_add_string(response, "status", "confirmed");
+		else
+			json_add_string(response, "status", "unconfirmed");
+
+		json_object_end(response);
+	}
+	json_array_end(response);
+
+	/* Add funds that are allocated to channels */
+	json_array_start(response, "channels");
+	list_for_each(&cmd->ld->peers, p, list) {
+		struct channel *c;
+		list_for_each(&p->channels, c, list) {
+			json_object_start(response, NULL);
+			json_add_pubkey(response, "peer_id", &p->id);
+			if (c->scid)
+				json_add_short_channel_id(response,
+							  "short_channel_id",
+							  c->scid);
+
+			/* Poor man's rounding to satoshis to match the unit for outputs */
+			json_add_u64(response, "channel_sat",
+				     (c->our_msatoshi + 500)/1000);
+			json_add_u64(response, "channel_total_sat",
+				     c->funding_satoshi);
+			json_add_txid(response, "funding_txid",
+				      &c->funding_txid);
+			json_object_end(response);
+		}
+	}
+	json_array_end(response);
+	json_object_end(response);
+
+	command_success(cmd, response);
+}
+
 static const struct json_command listfunds_command = {
-    "listfunds", json_listfunds,
-    "List funds available to the daemon to open channels",
-    "Returns an array of available outputs"};
+	"listfunds",
+	json_listfunds,
+	"Show available funds from the internal wallet", false,
+	"Returns a list of funds (outputs) that can be used by the internal wallet to open new channels or can be withdrawn, using the `withdraw` command, to another wallet."
+};
 AUTODATA(json_command, &listfunds_command);
+
+struct txo_rescan {
+	struct command *cmd;
+	struct utxo **utxos;
+	struct json_result *response;
+};
+
+static void process_utxo_result(struct bitcoind *bitcoind,
+				const struct bitcoin_tx_output *txout,
+				void *arg)
+{
+	struct txo_rescan *rescan = arg;
+	struct json_result *response = rescan->response;
+	struct utxo *u = rescan->utxos[0];
+	enum output_status newstate =
+	    txout == NULL ? output_state_spent : output_state_available;
+
+	json_object_start(rescan->response, NULL);
+	json_add_txid(response, "txid", &u->txid);
+	json_add_num(response, "output", u->outnum);
+	json_add_num(response, "oldstate", u->status);
+	json_add_num(response, "newstate", newstate);
+	json_object_end(rescan->response);
+	wallet_update_output_status(bitcoind->ld->wallet, &u->txid, u->outnum,
+				    u->status, newstate);
+
+	/* Remove the utxo we just resolved */
+	rescan->utxos[0] = rescan->utxos[tal_count(rescan->utxos) - 1];
+	tal_resize(&rescan->utxos, tal_count(rescan->utxos) - 1);
+
+	if (tal_count(rescan->utxos) == 0) {
+		/* Complete the response */
+		json_array_end(rescan->response);
+		json_object_end(rescan->response);
+		command_success(rescan->cmd, rescan->response);
+	} else {
+		bitcoind_gettxout(
+		    bitcoind->ld->topology->bitcoind, &rescan->utxos[0]->txid,
+		    rescan->utxos[0]->outnum, process_utxo_result, rescan);
+	}
+}
+
+static void json_dev_rescan_outputs(struct command *cmd,
+				    const char *buffer UNUSED,
+				    const jsmntok_t *params UNUSED)
+{
+	struct txo_rescan *rescan = tal(cmd, struct txo_rescan);
+	rescan->response = new_json_result(cmd);
+	rescan->cmd = cmd;
+
+	/* Open the result structure so we can incrementally add results */
+	json_object_start(rescan->response, NULL);
+	json_array_start(rescan->response, "outputs");
+	rescan->utxos = wallet_get_utxos(rescan, cmd->ld->wallet, output_state_any);
+	if (tal_count(rescan->utxos) == 0) {
+		json_array_end(rescan->response);
+		json_object_end(rescan->response);
+		command_success(cmd, rescan->response);
+		return;
+	}
+	bitcoind_gettxout(cmd->ld->topology->bitcoind, &rescan->utxos[0]->txid,
+			  rescan->utxos[0]->outnum, process_utxo_result,
+			  rescan);
+	command_still_pending(cmd);
+}
+
+static const struct json_command dev_rescan_output_command = {
+    "dev-rescan-outputs", json_dev_rescan_outputs,
+    "Synchronize the state of our funds with bitcoind", false,
+    "For each output stored in the internal wallet ask `bitcoind` whether we are in sync with its state (spent vs. unspent)"
+};
+AUTODATA(json_command, &dev_rescan_output_command);

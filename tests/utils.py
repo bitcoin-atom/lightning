@@ -1,6 +1,4 @@
-from bitcoin.rpc import RawProxy as BitcoinProxy
-from lightning import LightningRpc
-
+import binascii
 import logging
 import os
 import re
@@ -8,6 +6,8 @@ import sqlite3
 import subprocess
 import threading
 import time
+
+from bitcoin.rpc import RawProxy as BitcoinProxy
 
 
 BITCOIND_CONFIG = {
@@ -26,6 +26,7 @@ LIGHTNINGD_CONFIG = {
 }
 
 DEVELOPER = os.getenv("DEVELOPER", "0") == "1"
+
 
 def write_config(filename, opts):
     with open(filename, 'w') as f:
@@ -85,6 +86,12 @@ class TailableProc(object):
 
         return self.proc.returncode
 
+    def kill(self):
+        """Kill process without giving it warning."""
+        self.proc.kill()
+        self.proc.wait()
+        self.thread.join()
+
     def tail(self):
         """Tail the stdout of the process and remember it.
 
@@ -100,12 +107,13 @@ class TailableProc(object):
                 logging.debug("%s: %s", self.prefix, line.decode().rstrip())
                 self.logs_cond.notifyAll()
         self.running = False
+        self.proc.stdout.close()
 
-    def is_in_log(self, regex):
+    def is_in_log(self, regex, start=0):
         """Look for `regex` in the logs."""
 
         ex = re.compile(regex)
-        for l in self.logs:
+        for l in self.logs[start:]:
             if ex.search(l):
                 logging.debug("Found '%s' in logs", regex)
                 return True
@@ -121,18 +129,15 @@ class TailableProc(object):
         fail if the timeout is exceeded or if the underlying process
         exits before all the `regexs` were found.
 
+        If timeout is None, no time-out is applied.
         """
         logging.debug("Waiting for {} in the logs".format(regexs))
         exs = [re.compile(r) for r in regexs]
         start_time = time.time()
         pos = self.logsearch_start
-        initial_pos = len(self.logs)
         while True:
-            if time.time() > start_time + timeout:
-                print("Can't find {} in logs".format(exs))
-                with self.logs_cond:
-                    for i in range(initial_pos, len(self.logs)):
-                        print("  " + self.logs[i])
+            if timeout is not None and time.time() > start_time + timeout:
+                print("Time-out: can't find {} in logs".format(exs))
                 for r in exs:
                     if self.is_in_log(r):
                         print("({} was previously in logs!)".format(r))
@@ -146,7 +151,7 @@ class TailableProc(object):
                     continue
 
                 for r in exs.copy():
-                    self.logsearch_start = pos+1
+                    self.logsearch_start = pos + 1
                     if r.search(self.logs[pos]):
                         logging.debug("Found '%s' in logs", r)
                         exs.remove(r)
@@ -172,7 +177,7 @@ class SimpleBitcoinProxy:
     library to close, reopen and reauth upon failure.
     """
     def __init__(self, btc_conf_file, *args, **kwargs):
-        self.__btc_conf_file__= btc_conf_file
+        self.__btc_conf_file__ = btc_conf_file
 
     def __getattr__(self, name):
         if name.startswith('__') and name.endswith('__'):
@@ -220,7 +225,7 @@ class BitcoinD(TailableProc):
 
     def start(self):
         TailableProc.start(self)
-        self.wait_for_log("Done loading", timeout=10)
+        self.wait_for_log("Done loading", timeout=60)
 
         logging.info("BitcoinD started")
 
@@ -234,6 +239,7 @@ class BitcoinD(TailableProc):
 # lightning-4 => 0382ce59ebf18be7d84677c2e35f23294b9992ceca95491fcf8a56c6cb2d9de199 aka JUNIORFELONY #0382ce
 # lightning-5 => 032cf15d1ad9c4a08d26eab1918f732d8ef8fdc6abb9640bf3db174372c491304e aka SOMBERFIRE #032cf1
 
+
 class LightningD(TailableProc):
     def __init__(self, lightning_dir, bitcoin_dir, port=9735, random_hsm=False):
         TailableProc.__init__(self, lightning_dir)
@@ -246,14 +252,16 @@ class LightningD(TailableProc):
             '--bitcoin-datadir={}'.format(bitcoin_dir),
             '--lightning-dir={}'.format(lightning_dir),
             '--port={}'.format(port),
+            '--allow-deprecated-apis=false',
             '--override-fee-rates=15000/7500/1000',
-            '--network=regtest'
+            '--network=regtest',
+            '--ignore-fee-limits=false'
         ]
         if DEVELOPER:
             self.cmd_line += ['--dev-broadcast-interval=1000']
             if not random_hsm:
-                self.cmd_line += ['--dev-hsm-seed={}'.format(seed.hex())]
-        self.cmd_line += ["--{}={}".format(k, v) for k, v in LIGHTNINGD_CONFIG.items()]
+                self.cmd_line += ['--dev-hsm-seed={}'.format(binascii.hexlify(seed).decode('ascii'))]
+        self.cmd_line += ["--{}={}".format(k, v) for k, v in sorted(LIGHTNINGD_CONFIG.items())]
         self.prefix = 'lightningd(%d)' % (port)
 
         if not os.path.exists(lightning_dir):
@@ -261,7 +269,7 @@ class LightningD(TailableProc):
 
     def start(self):
         TailableProc.start(self)
-        self.wait_for_log("Hello world from")
+        self.wait_for_log("Server started with public key")
         logging.info("LightningD started")
 
     def wait(self, timeout=10):
@@ -272,6 +280,7 @@ class LightningD(TailableProc):
         """
         self.proc.wait(timeout)
         return self.proc.returncode
+
 
 class LightningNode(object):
     def __init__(self, daemon, rpc, btc, executor, may_fail=False):
@@ -292,7 +301,7 @@ class LightningNode(object):
         def call_connect():
             try:
                 self.rpc.connect('127.0.0.1', remote_node.daemon.port, tx['hex'], async=False)
-            except:
+            except Exception:
                 pass
         t = threading.Thread(target=call_connect)
         t.daemon = True
@@ -308,30 +317,42 @@ class LightningNode(object):
 
             self.bitcoin.generate_block(1)
 
-            #fut.result(timeout=5)
+            # fut.result(timeout=5)
 
             # Now wait for confirmation
-            self.daemon.wait_for_log("-> CHANNELD_NORMAL|STATE_NORMAL")
-            remote_node.daemon.wait_for_log("-> CHANNELD_NORMAL|STATE_NORMAL")
+            self.daemon.wait_for_log(" to CHANNELD_NORMAL|STATE_NORMAL")
+            remote_node.daemon.wait_for_log(" to CHANNELD_NORMAL|STATE_NORMAL")
 
         if async:
             return self.executor.submit(wait_connected)
         else:
             return wait_connected()
 
-    def openchannel(self, remote_node, capacity):
-        addr = self.rpc.newaddr()['address']
-        txid = self.bitcoin.rpc.sendtoaddress(addr, capacity / 10**6)
-        tx = self.bitcoin.rpc.getrawtransaction(txid)
-        self.rpc.addfunds(tx)
-        self.rpc.fundchannel(remote_node.info['id'], capacity)
+    def openchannel(self, remote_node, capacity, addrtype="p2sh-segwit"):
+        addr, wallettxid = self.fundwallet(capacity, addrtype)
+        fundingtx = self.rpc.fundchannel(remote_node.info['id'], capacity)
         self.daemon.wait_for_log('sendrawtx exit 0, gave')
-        time.sleep(1)
         self.bitcoin.generate_block(6)
-        self.daemon.wait_for_log('-> CHANNELD_NORMAL|STATE_NORMAL')
+        self.daemon.wait_for_log('to CHANNELD_NORMAL|STATE_NORMAL')
+        return {'address': addr, 'wallettxid': wallettxid, 'fundingtx': fundingtx}
+
+    def fundwallet(self, sats, addrtype="p2sh-segwit"):
+        addr = self.rpc.newaddr(addrtype)['address']
+        txid = self.bitcoin.rpc.sendtoaddress(addr, sats / 10**6)
+        self.bitcoin.generate_block(1)
+        self.daemon.wait_for_log('Owning output .* txid {}'.format(txid))
+        return addr, txid
+
+    def getactivechannels(self):
+        return [c for c in self.rpc.listchannels()['channels'] if c['active']]
 
     def db_query(self, query):
-        db = sqlite3.connect(os.path.join(self.daemon.lightning_dir, "lightningd.sqlite3"))
+        from shutil import copyfile
+        orig = os.path.join(self.daemon.lightning_dir, "lightningd.sqlite3")
+        copy = os.path.join(self.daemon.lightning_dir, "lightningd-copy.sqlite3")
+        copyfile(orig, copy)
+
+        db = sqlite3.connect(copy)
         db.row_factory = sqlite3.Row
         c = db.cursor()
         c.execute(query)
@@ -345,6 +366,16 @@ class LightningNode(object):
         db.close()
         return result
 
+    # Assumes node is stopped!
+    def db_manip(self, query):
+        db = sqlite3.connect(os.path.join(self.daemon.lightning_dir, "lightningd.sqlite3"))
+        db.row_factory = sqlite3.Row
+        c = db.cursor()
+        c.execute(query)
+        db.commit()
+        c.close()
+        db.close()
+
     def stop(self, timeout=10):
         """ Attempt to do a clean shutdown, but kill if it hangs
         """
@@ -353,7 +384,7 @@ class LightningNode(object):
         try:
             # May fail if the process already died
             self.rpc.stop()
-        except:
+        except Exception:
             pass
 
         rc = self.daemon.wait(timeout)

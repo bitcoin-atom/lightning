@@ -22,6 +22,7 @@
 #define OP_NOTIF	0x64
 #define OP_ELSE		0x67
 #define OP_ENDIF	0x68
+#define OP_RETURN	0x6a
 #define OP_2DROP	0x6d
 #define OP_DEPTH	0x74
 #define OP_DROP		0x75
@@ -211,6 +212,14 @@ u8 *scriptpubkey_p2pkh(const tal_t *ctx, const struct bitcoin_address *addr)
 	add_push_bytes(&script, &addr->addr, sizeof(addr->addr));
 	add_op(&script, OP_EQUALVERIFY);
 	add_op(&script, OP_CHECKSIG);
+	return script;
+}
+
+u8 *scriptpubkey_opreturn(const tal_t *ctx)
+{
+	u8 *script = tal_arr(ctx, u8, 0);
+
+	add_op(&script, OP_RETURN);
 	return script;
 }
 
@@ -512,7 +521,7 @@ u8 **bitcoin_to_local_spend_revocation(const tal_t *ctx,
  *
  * #### Offered HTLC Outputs
  *
- * This output sends funds to a HTLC-timeout transaction after the HTLC
+ * This output sends funds to an HTLC-timeout transaction after the HTLC
  * timeout, or to the remote peer using the payment preimage or the revocation
  * key.  The output is a P2WSH, with a witness script:
  *

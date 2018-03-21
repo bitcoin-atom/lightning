@@ -1,43 +1,49 @@
-#include <ccan/io/io.h>
 #include <ccan/tal/str/str.h>
-#include <common/crypto_sync.h>
+#include <common/gen_peer_status_wire.h>
+#include <common/gen_status_wire.h>
+#include <common/peer_billboard.h>
 #include <common/peer_failed.h>
 #include <common/status.h>
-#include <fcntl.h>
+#include <common/wire_error.h>
 #include <stdarg.h>
-#include <unistd.h>
-#include <wire/gen_peer_wire.h>
 
 /* We only support one channel per peer anyway */
-void peer_failed(int peer_fd, struct crypto_state *cs,
-		 const struct channel_id *channel_id,
-		 const char *fmt, ...)
+void peer_failed_(int peer_fd, int gossip_fd,
+		  struct crypto_state *cs, u64 gossip_index,
+		  const struct channel_id *channel_id,
+		  const char *fmt, ...)
 {
 	va_list ap;
-	const char *errmsg;
-	struct channel_id all_channels;
+	const char *desc;
 	u8 *msg;
 
-	/* BOLT #1:
-	 *
-	 * The channel is referred to by `channel_id` unless `channel_id` is
-	 * zero (ie. all bytes zero), in which case it refers to all channels.
-	 */
-	if (!channel_id) {
-		memset(&all_channels, 0, sizeof(all_channels));
-		channel_id = &all_channels;
-	}
-
-	va_start(ap, fmt);
-	errmsg = tal_vfmt(NULL, fmt, ap);
+ 	va_start(ap, fmt);
+	desc = tal_vfmt(NULL, fmt, ap);
 	va_end(ap);
-	/* Make sure it's correct length for error. */
-	tal_resize(&errmsg, strlen(errmsg)+1);
-	msg = towire_error(errmsg, channel_id, (const u8 *)errmsg);
 
-	/* This is only best-effort; don't block. */
-	io_fd_block(peer_fd, false);
-	sync_crypto_write(cs, peer_fd, take(msg));
+	msg = towire_status_peer_error(NULL, channel_id,
+				       desc, cs, gossip_index,
+				       towire_errorfmt(desc, channel_id,
+						       "%s", desc));
+	peer_billboard(true, desc);
+	tal_free(desc);
+	status_send_fatal(take(msg), peer_fd, gossip_fd);
+}
 
-	status_failed(STATUS_FAIL_PEER_BAD, "%s", errmsg);
+/* We're failing because peer sent us an error message */
+void peer_failed_received_errmsg(int peer_fd, int gossip_fd,
+				 struct crypto_state *cs, u64 gossip_index,
+				 const char *desc,
+				 const struct channel_id *channel_id)
+{
+	u8 *msg = towire_status_peer_error(NULL, channel_id,
+					   desc, cs, gossip_index, NULL);
+	peer_billboard(true, "Received error from peer: %s", desc);
+	status_send_fatal(take(msg), peer_fd, gossip_fd);
+}
+
+void peer_failed_connection_lost(void)
+{
+	status_send_fatal(take(towire_status_peer_connection_lost(NULL)),
+			  -1, -1);
 }

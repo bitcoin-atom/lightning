@@ -60,14 +60,6 @@ void towire_shachain(u8 **pptr, const struct shachain *shachain)
 	}
 }
 
-void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx)
-{
-	u8 *txlin = linearize_tx(NULL, tx);
-
-	towire(pptr, txlin, tal_len(txlin));
-	tal_free(txlin);
-}
-
 void fromwire_added_htlc(const u8 **cursor, size_t *max,
 			 struct added_htlc *added)
 {
@@ -86,16 +78,18 @@ void fromwire_fulfilled_htlc(const u8 **cursor, size_t *max,
 	fromwire_preimage(cursor, max, &fulfilled->payment_preimage);
 }
 
-void fromwire_failed_htlc(const tal_t *ctx, const u8 **cursor, size_t *max,
-			  struct failed_htlc *failed)
+struct failed_htlc *fromwire_failed_htlc(const tal_t *ctx, const u8 **cursor, size_t *max)
 {
 	u16 failreason_len;
+	struct failed_htlc *failed = tal(ctx, struct failed_htlc);
 
 	failed->id = fromwire_u64(cursor, max);
 	failed->malformed = fromwire_u16(cursor, max);
 	failreason_len = fromwire_u16(cursor, max);
-	failed->failreason = tal_arr(ctx, u8, failreason_len);
+	failed->failreason = tal_arr(failed, u8, failreason_len);
 	fromwire_u8_array(cursor, max, failed->failreason, failreason_len);
+
+	return failed;
 }
 
 enum htlc_state fromwire_htlc_state(const u8 **cursor, size_t *max)
@@ -139,18 +133,5 @@ void fromwire_shachain(const u8 **cursor, size_t *max,
 	for (i = 0; i < shachain->num_valid; i++) {
 		shachain->known[i].index = fromwire_u64(cursor, max);
 		fromwire_sha256(cursor, max, &shachain->known[i].hash);
-	}
-}
-
-void fromwire_bitcoin_tx(const u8 **cursor, size_t *max, struct bitcoin_tx *tx)
-{
-	/* FIXME: We'd really expect to allocate tx ourselves, but
-	 * for the sake of simple structures, we don't write the
-	 * generator that way. */
-	struct bitcoin_tx *tx2 = pull_bitcoin_tx(tx, cursor, max);
-	if (tx2) {
-		*tx = *tx2;
-		/* This hangs around with tx until freed */
-		notleak(tx2);
 	}
 }

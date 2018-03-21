@@ -7,8 +7,8 @@
 #include <ccan/time/time.h>
 #include <ccan/timer/timer.h>
 #include <lightningd/htlc_end.h>
-#include <lightningd/txfilter.h>
 #include <stdio.h>
+#include <wallet/txfilter.h>
 #include <wallet/wallet.h>
 
 /* BOLT #1:
@@ -34,9 +34,6 @@ struct config {
 
 	/* How long will we accept them waiting? */
 	u32 anchor_confirms_max;
-
-	/* How many blocks until we stop watching a close commit? */
-	u32 forever_confirms;
 
 	/* Maximum percent of fee rate we'll accept. */
 	u32 commitment_fee_max_percent;
@@ -66,13 +63,22 @@ struct config {
 	/* How long between changing commit and sending COMMIT message. */
 	struct timerel commit_time;
 
-	/* Disable automatic reconnects */
-	bool no_reconnect;
+	/* How often to broadcast gossip (msec) */
+	u32 broadcast_interval;
+
+	/* Channel update interval */
+	u32 channel_update_interval;
+
+	/* Do we let the funder set any fee rate they want */
+	bool ignore_fee_limits;
 };
 
 struct lightningd {
 	/* The directory to find all the subdaemons. */
 	const char *daemon_dir;
+
+	/* Are we told to run in the background. */
+	bool daemon;
 
 	/* Our config dir, and rpc file */
 	char *config_dir;
@@ -81,9 +87,11 @@ struct lightningd {
 	/* Configuration settings. */
 	struct config config;
 
-	/* Log for general stuff. */
+	/* This log_book is owned by all the struct logs */
 	struct log_book *log_book;
+	/* Log for general stuff. */
 	struct log *log;
+	const char *logfile;
 
 	/* This is us. */
 	struct pubkey id;
@@ -103,6 +111,7 @@ struct lightningd {
 
 	/* Bearer of all my secrets. */
 	int hsm_fd;
+	struct log *hsm_log;
 
 	/* Daemon looking after peers during init / before channel. */
 	struct subd *gossip;
@@ -122,18 +131,31 @@ struct lightningd {
 	struct htlc_in_map htlcs_in;
 	struct htlc_out_map htlcs_out;
 
-	u32 broadcast_interval;
-
 	struct wallet *wallet;
+
+	/* Outstanding waitsendpay commands. */
+	struct list_head waitsendpay_commands;
+	/* Outstanding sendpay commands. */
+	struct list_head sendpay_commands;
 
 	/* Maintained by invoices.c */
 	struct invoices *invoices;
 
-	/* Any outstanding "pay" commands. */
-	struct list_head pay_commands;
-
 	/* Transaction filter matching what we're interested in */
 	struct txfilter *owned_txfilter;
+
+	/* PID file */
+	char *pidfile;
+
+	/* May be useful for non-developers debugging in the field */
+	char *debug_subdaemon_io;
+
+	/* Disable automatic reconnects */
+	bool no_reconnect;
+
+	/* Initial autocleaninvoice settings. */
+	u64 ini_autocleaninvoice_cycle;
+	u64 ini_autocleaninvoice_expiredby;
 
 #if DEVELOPER
 	/* If we want to debug a subdaemon. */
@@ -153,26 +175,12 @@ struct lightningd {
 #endif /* DEVELOPER */
 };
 
-/**
- * derive_peer_seed - Generate a unique secret for this peer's channel
- *
- * @ld: the lightning daemon to get global secret from
- * @peer_seed: where to store the generated secret
- * @peer_id: the id node_id of the remote peer
- * @chan_id: channel ID
- *
- * This method generates a unique secret from the given parameters. It
- * is important that this secret be unique for each channel, but it
- * must be reproducible for the same channel in case of
- * reconnection. We use the DB channel ID to guarantee unique secrets
- * per channel.
- */
-void derive_peer_seed(struct lightningd *ld, struct privkey *peer_seed,
-		      const struct pubkey *peer_id, const u64 channel_id);
-
-struct chainparams *get_chainparams(const struct lightningd *ld);
+const struct chainparams *get_chainparams(const struct lightningd *ld);
 
 /* State for performing backtraces. */
 struct backtrace_state *backtrace_state;
+
+/* Check we can run subdaemons, and check their versions */
+void test_daemons(const struct lightningd *ld);
 
 #endif /* LIGHTNING_LIGHTNINGD_LIGHTNINGD_H */

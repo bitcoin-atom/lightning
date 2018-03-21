@@ -91,9 +91,18 @@ static void children_into_htable(const void *exclude1, const void *exclude2,
 			if (streq(name, "backtrace"))
 				continue;
 
+			/* Don't add tal_link objects */
+			if (strends(name, "struct link")
+			    || strends(name, "struct linkable"))
+				continue;
+
 			/* ccan/io allocates pollfd array. */
 			if (streq(name,
 				  "ccan/ccan/io/poll.c:40:struct pollfd[]"))
+				continue;
+
+			/* Don't add tmpctx. */
+			if (streq(name, "tmpctx"))
 				continue;
 		}
 		htable_add(memtable, hash_ptr(i, NULL), i);
@@ -213,7 +222,7 @@ static int append_bt(void *data, uintptr_t pc)
 	return 0;
 }
 
-static void add_backtrace(tal_t *parent, enum tal_notify_type type UNNEEDED,
+static void add_backtrace(tal_t *parent UNUSED, enum tal_notify_type type UNNEEDED,
 			  void *child)
 {
 	uintptr_t *bt = tal_alloc_arr_(child, sizeof(uintptr_t), 32, true, true,

@@ -5,13 +5,19 @@ doc-wrongdir:
 	$(MAKE) -C .. doc-all
 
 MANPAGES := doc/lightning-cli.1 \
+	doc/lightning-autocleaninvoice.7 \
+	doc/lightning-decodepay.7 \
+	doc/lightning-delexpiredinvoice.7 \
 	doc/lightning-delinvoice.7 \
 	doc/lightning-getroute.7 \
 	doc/lightning-invoice.7 \
-	doc/lightning-listinvoice.7 \
+	doc/lightning-listinvoices.7 \
+	doc/lightning-listpayments.7 \
+	doc/lightning-pay.7 \
 	doc/lightning-sendpay.7 \
 	doc/lightning-waitinvoice.7 \
-	doc/lightning-waitanyinvoice.7
+	doc/lightning-waitanyinvoice.7 \
+	doc/lightning-waitsendpay.7
 
 doc-all: $(MANPAGES)
 

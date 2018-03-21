@@ -1,16 +1,19 @@
 #include "routing.h"
 #include <arpa/inet.h>
 #include <bitcoin/block.h>
+#include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
-#include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/endian/endian.h>
 #include <ccan/structeq/structeq.h>
 #include <ccan/tal/str/str.h>
+#include <common/features.h>
 #include <common/pseudorand.h>
 #include <common/status.h>
 #include <common/type_to_string.h>
+#include <common/wire_error.h>
 #include <common/wireaddr.h>
 #include <inttypes.h>
+#include <wire/gen_onion_wire.h>
 #include <wire/gen_peer_wire.h>
 
 #ifndef SUPERVERBOSE
@@ -26,6 +29,52 @@
 /* Proportional fee must be less than 24 bits, so never overflows. */
 #define MAX_PROPORTIONAL_FEE (1 << 24)
 
+/* We've unpacked and checked its signatures, now we wait for master to tell
+ * us the txout to check */
+struct pending_cannouncement {
+	/* Off routing_state->pending_cannouncement */
+	struct list_node list;
+
+	/* Unpacked fields here */
+	struct short_channel_id short_channel_id;
+	struct pubkey node_id_1;
+	struct pubkey node_id_2;
+	struct pubkey bitcoin_key_1;
+	struct pubkey bitcoin_key_2;
+
+	/* The raw bits */
+	const u8 *announce;
+
+	/* Deferred updates, if we received them while waiting for
+	 * this (one for each direction) */
+	const u8 *updates[2];
+
+	/* Only ever replace with newer updates */
+	u32 update_timestamps[2];
+};
+
+struct pending_node_announce {
+	struct pubkey nodeid;
+	u8 *node_announcement;
+	u32 timestamp;
+};
+
+static const secp256k1_pubkey *
+pending_node_announce_keyof(const struct pending_node_announce *a)
+{
+	return &a->nodeid.pubkey;
+}
+
+static bool pending_node_announce_eq(const struct pending_node_announce *pna,
+				     const secp256k1_pubkey *key)
+{
+	return structeq(&pna->nodeid.pubkey, key);
+}
+
+HTABLE_DEFINE_TYPE(struct pending_node_announce, pending_node_announce_keyof,
+		   node_map_hash_key, pending_node_announce_eq,
+		   pending_node_map);
+
 static struct node_map *empty_node_map(const tal_t *ctx)
 {
 	struct node_map *map = tal(ctx, struct node_map);
@@ -36,13 +85,21 @@ static struct node_map *empty_node_map(const tal_t *ctx)
 
 struct routing_state *new_routing_state(const tal_t *ctx,
 					const struct bitcoin_blkid *chain_hash,
-					const struct pubkey *local_id)
+					const struct pubkey *local_id,
+					u32 prune_timeout)
 {
 	struct routing_state *rstate = tal(ctx, struct routing_state);
 	rstate->nodes = empty_node_map(rstate);
 	rstate->broadcasts = new_broadcast_state(rstate);
 	rstate->chain_hash = *chain_hash;
 	rstate->local_id = *local_id;
+	rstate->prune_timeout = prune_timeout;
+	list_head_init(&rstate->pending_cannouncement);
+	uintmap_init(&rstate->chanmap);
+
+	rstate->pending_node_map = tal(ctx, struct pending_node_map);
+	pending_node_map_init(rstate->pending_node_map);
+
 	return rstate;
 }
 
@@ -62,17 +119,16 @@ bool node_map_node_eq(const struct node *n, const secp256k1_pubkey *key)
 	return structeq(&n->id.pubkey, key);
 }
 
-static void destroy_node(struct node *node)
+static void destroy_node(struct node *node, struct routing_state *rstate)
 {
+	node_map_del(rstate->nodes, node);
+
 	/* These remove themselves from the array. */
-	while (tal_count(node->in))
-		tal_free(node->in[0]);
-	while (tal_count(node->out))
-		tal_free(node->out[0]);
+	while (tal_count(node->chans))
+		tal_free(node->chans[0]);
 }
 
-static struct node *get_node(struct routing_state *rstate,
-		      const struct pubkey *id)
+struct node *get_node(struct routing_state *rstate, const struct pubkey *id)
 {
 	return node_map_get(rstate->nodes, &id->pubkey);
 }
@@ -86,153 +142,105 @@ static struct node *new_node(struct routing_state *rstate,
 
 	n = tal(rstate, struct node);
 	n->id = *id;
-	n->in = tal_arr(n, struct node_connection *, 0);
-	n->out = tal_arr(n, struct node_connection *, 0);
+	n->chans = tal_arr(n, struct chan *, 0);
 	n->alias = NULL;
-	n->node_announcement = NULL;
+	n->node_announce_msgidx = 0;
 	n->last_timestamp = -1;
 	n->addresses = tal_arr(n, struct wireaddr, 0);
 	node_map_add(rstate->nodes, n);
-	tal_add_destructor(n, destroy_node);
+	tal_add_destructor2(n, destroy_node, rstate);
 
 	return n;
 }
 
-static bool remove_conn_from_array(struct node_connection ***conns,
-				   struct node_connection *nc)
+static bool remove_channel_from_array(struct chan ***chans, struct chan *c)
 {
 	size_t i, n;
 
-	n = tal_count(*conns);
+	n = tal_count(*chans);
 	for (i = 0; i < n; i++) {
-		if ((*conns)[i] != nc)
+		if ((*chans)[i] != c)
 			continue;
 		n--;
-		memmove(*conns + i, *conns + i + 1, sizeof(**conns) * (n - i));
-		tal_resize(conns, n);
+		memmove(*chans + i, *chans + i + 1, sizeof(**chans) * (n - i));
+		tal_resize(chans, n);
 		return true;
 	}
 	return false;
 }
 
-static void destroy_connection(struct node_connection *nc)
+static void destroy_chan(struct chan *chan, struct routing_state *rstate)
 {
-	if (!remove_conn_from_array(&nc->dst->in, nc)
-	    || !remove_conn_from_array(&nc->src->out, nc))
+	if (!remove_channel_from_array(&chan->nodes[0]->chans, chan)
+	    || !remove_channel_from_array(&chan->nodes[1]->chans, chan))
 		/* FIXME! */
 		abort();
+
+	uintmap_del(&rstate->chanmap, chan->scid.u64);
+
+	if (tal_count(chan->nodes[0]->chans) == 0)
+		tal_free(chan->nodes[0]);
+	if (tal_count(chan->nodes[1]->chans) == 0)
+		tal_free(chan->nodes[1]);
 }
 
-static struct node_connection * get_connection(struct routing_state *rstate,
-					       const struct pubkey *from_id,
-					       const struct pubkey *to_id)
+static void init_half_chan(struct routing_state *rstate,
+				 struct chan *chan,
+				 int idx)
 {
-	int i, n;
-	struct node *from, *to;
-	from = get_node(rstate, from_id);
-	to = get_node(rstate, to_id);
-	if (!from || ! to)
-		return NULL;
+	struct half_chan *c = &chan->half[idx];
 
-	n = tal_count(to->in);
-	for (i = 0; i < n; i++) {
-		if (to->in[i]->src == from)
-			return to->in[i];
-	}
-	return NULL;
+	c->channel_update_msgidx = 0;
+	c->unroutable_until = 0;
+	c->active = false;
+	c->flags = idx;
+	/* We haven't seen channel_update: make it halfway to prune time,
+	 * which should be older than any update we'd see. */
+	c->last_timestamp = time_now().ts.tv_sec - rstate->prune_timeout/2;
 }
 
-struct node_connection *get_connection_by_scid(const struct routing_state *rstate,
-					      const struct short_channel_id *schanid,
-					      const u8 direction)
+struct chan *new_chan(struct routing_state *rstate,
+		      const struct short_channel_id *scid,
+		      const struct pubkey *id1,
+		      const struct pubkey *id2)
 {
-	struct node *n;
-	int i, num_conn;
-	struct node_map *nodes = rstate->nodes;
-	struct node_connection *c;
-	struct node_map_iter it;
+	struct chan *chan = tal(rstate, struct chan);
+	int n1idx = pubkey_idx(id1, id2);
+	size_t n;
+	struct node *n1, *n2;
 
-	//FIXME(cdecker) We probably want to speed this up by indexing by chanid.
-	for (n = node_map_first(nodes, &it); n; n = node_map_next(nodes, &it)) {
-	        num_conn = tal_count(n->out);
-		for (i = 0; i < num_conn; i++){
-			c = n->out[i];
-			if (short_channel_id_eq(&c->short_channel_id, schanid) &&
-			    (c->flags&0x1) == direction)
-			    return c;
-		}
-	}
-	return NULL;
+	/* Create nodes on demand */
+	n1 = get_node(rstate, id1);
+	if (!n1)
+		n1 = new_node(rstate, id1);
+	n2 = get_node(rstate, id2);
+	if (!n2)
+		n2 = new_node(rstate, id2);
+
+	chan->scid = *scid;
+	chan->nodes[n1idx] = n1;
+	chan->nodes[!n1idx] = n2;
+	chan->txout_script = NULL;
+	chan->channel_announce_msgidx = 0;
+	chan->public = false;
+	chan->satoshis = 0;
+
+	n = tal_count(n2->chans);
+	tal_resize(&n2->chans, n+1);
+	n2->chans[n] = chan;
+	n = tal_count(n1->chans);
+	tal_resize(&n1->chans, n+1);
+	n1->chans[n] = chan;
+
+	/* Populate with (inactive) connections */
+	init_half_chan(rstate, chan, n1idx);
+	init_half_chan(rstate, chan, !n1idx);
+
+	uintmap_add(&rstate->chanmap, scid->u64, chan);
+
+	tal_add_destructor2(chan, destroy_chan, rstate);
+	return chan;
 }
-
-static struct node_connection *
-get_or_make_connection(struct routing_state *rstate,
-		       const struct pubkey *from_id,
-		       const struct pubkey *to_id)
-{
-	size_t i, n;
-	struct node *from, *to;
-	struct node_connection *nc;
-
-	from = get_node(rstate, from_id);
-	if (!from)
-		from = new_node(rstate, from_id);
-	to = get_node(rstate, to_id);
-	if (!to)
-		to = new_node(rstate, to_id);
-
-	n = tal_count(to->in);
-	for (i = 0; i < n; i++) {
-		if (to->in[i]->src == from) {
-			status_trace("Updating existing route from %s to %s",
-				     type_to_string(trc, struct pubkey,
-						    &from->id),
-				     type_to_string(trc, struct pubkey,
-						    &to->id));
-			return to->in[i];
-		}
-	}
-
-	status_trace("Creating new route from %s to %s",
-		     type_to_string(trc, struct pubkey, &from->id),
-		     type_to_string(trc, struct pubkey, &to->id));
-
-	nc = tal(rstate, struct node_connection);
-	nc->src = from;
-	nc->dst = to;
-	nc->channel_announcement = NULL;
-	nc->channel_update = NULL;
-
-	/* Hook it into in/out arrays. */
-	i = tal_count(to->in);
-	tal_resize(&to->in, i+1);
-	to->in[i] = nc;
-	i = tal_count(from->out);
-	tal_resize(&from->out, i+1);
-	from->out[i] = nc;
-
-	tal_add_destructor(nc, destroy_connection);
-	return nc;
-}
-
-struct node_connection *half_add_connection(
-					    struct routing_state *rstate,
-					    const struct pubkey *from,
-					    const struct pubkey *to,
-					    const struct short_channel_id *schanid,
-					    const u16 flags
-	)
-{
-	struct node_connection *nc;
-	nc = get_or_make_connection(rstate, from, to);
-	nc->short_channel_id = *schanid;
-	nc->active = false;
-	nc->flags = flags;
-	nc->last_timestamp = -1;
-	return nc;
-}
-
-
 
 /* Too big to reach, but don't overflow if added. */
 #define INFINITE 0x3FFFFFFFFFFFFFFFULL
@@ -251,7 +259,7 @@ static void clear_bfg(struct node_map *nodes)
 	}
 }
 
-static u64 connection_fee(const struct node_connection *c, u64 msatoshi)
+static u64 connection_fee(const struct half_chan *c, u64 msatoshi)
 {
 	u64 fee;
 
@@ -272,13 +280,28 @@ static u64 risk_fee(u64 amount, u32 delay, double riskfactor)
 
 /* We track totals, rather than costs.  That's because the fee depends
  * on the current amount passing through. */
-static void bfg_one_edge(struct node *node, size_t edgenum, double riskfactor)
+static void bfg_one_edge(struct node *node,
+			 struct chan *chan, int idx,
+			 double riskfactor,
+			 double fuzz, const struct siphash_seed *base_seed)
 {
-	struct node_connection *c = node->in[edgenum];
 	size_t h;
+	double fee_scale = 1.0;
+	const struct half_chan *c = &chan->half[idx];
 
-	assert(c->dst == node);
+	if (fuzz != 0.0) {
+		u64 h =	siphash24(base_seed, &chan->scid, sizeof(chan->scid));
+
+		/* Scale fees for this channel */
+		/* rand = (h / UINT64_MAX)  random number between 0.0 -> 1.0
+		 * 2*fuzz*rand              random number between 0.0 -> 2*fuzz
+		 * 2*fuzz*rand - fuzz       random number between -fuzz -> +fuzz
+		 */
+		fee_scale = 1.0 + (2.0 * fuzz * h / UINT64_MAX) - fuzz;
+	}
+
 	for (h = 0; h < ROUTING_MAX_HOPS; h++) {
+		struct node *src;
 		/* FIXME: Bias against smaller channels. */
 		u64 fee;
 		u64 risk;
@@ -286,7 +309,7 @@ static void bfg_one_edge(struct node *node, size_t edgenum, double riskfactor)
 		if (node->bfg[h].total == INFINITE)
 			continue;
 
-		fee = connection_fee(c, node->bfg[h].total);
+		fee = connection_fee(c, node->bfg[h].total) * fee_scale;
 		risk = node->bfg[h].risk + risk_fee(node->bfg[h].total + fee,
 						    c->delay, riskfactor);
 
@@ -298,29 +321,43 @@ static void bfg_one_edge(struct node *node, size_t edgenum, double riskfactor)
 			continue;
 		}
 
+		/* nodes[0] is src for connections[0] */
+		src = chan->nodes[idx];
 		if (node->bfg[h].total + fee + risk
-		    < c->src->bfg[h+1].total + c->src->bfg[h+1].risk) {
+		    < src->bfg[h+1].total + src->bfg[h+1].risk) {
 			SUPERVERBOSE("...%s can reach here in hoplen %zu total %"PRIu64,
 				     type_to_string(trc, struct pubkey,
-						    &c->src->id),
+						    &src->id),
 				     h, node->bfg[h].total + fee);
-			c->src->bfg[h+1].total = node->bfg[h].total + fee;
-			c->src->bfg[h+1].risk = risk;
-			c->src->bfg[h+1].prev = c;
+			src->bfg[h+1].total = node->bfg[h].total + fee;
+			src->bfg[h+1].risk = risk;
+			src->bfg[h+1].prev = chan;
 		}
 	}
 }
 
+/* Determine if the given half_chan is routable */
+static bool hc_is_routable(const struct half_chan *hc, time_t now)
+{
+	return hc->active && hc->unroutable_until < now;
+}
+
 /* riskfactor is already scaled to per-block amount */
-static struct node_connection *
+static struct chan **
 find_route(const tal_t *ctx, struct routing_state *rstate,
 	   const struct pubkey *from, const struct pubkey *to, u64 msatoshi,
-	   double riskfactor, u64 *fee, struct node_connection ***route)
+	   double riskfactor,
+	   double fuzz, const struct siphash_seed *base_seed,
+	   u64 *fee)
 {
+	struct chan **route;
 	struct node *n, *src, *dst;
 	struct node_map_iter it;
-	struct node_connection *first_conn;
 	int runs, i, best;
+	/* Call time_now() once at the start, so that our tight loop
+	 * does not keep calling into operating system for the
+	 * current time */
+	time_t now = time_now().ts.tv_sec;
 
 	/* Note: we map backwards, since we know the amount of satoshi we want
 	 * at the end, and need to derive how much we need to send. */
@@ -328,22 +365,22 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 	src = get_node(rstate, to);
 
 	if (!src) {
-		status_trace("find_route: cannot find %s",
-			     type_to_string(trc, struct pubkey, to));
+		status_info("find_route: cannot find %s",
+			    type_to_string(tmpctx, struct pubkey, to));
 		return NULL;
 	} else if (!dst) {
-		status_trace("find_route: cannot find myself (%s)",
-			     type_to_string(trc, struct pubkey, to));
+		status_info("find_route: cannot find myself (%s)",
+			    type_to_string(tmpctx, struct pubkey, to));
 		return NULL;
 	} else if (dst == src) {
-		status_trace("find_route: this is %s, refusing to create empty route",
-			     type_to_string(trc, struct pubkey, to));
+		status_info("find_route: this is %s, refusing to create empty route",
+			    type_to_string(tmpctx, struct pubkey, to));
 		return NULL;
 	}
 
 	if (msatoshi >= MAX_MSATOSHI) {
-		status_trace("find_route: can't route huge amount %"PRIu64,
-			     msatoshi);
+		status_info("find_route: can't route huge amount %"PRIu64,
+			    msatoshi);
 		return NULL;
 	}
 
@@ -361,17 +398,22 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 		for (n = node_map_first(rstate->nodes, &it);
 		     n;
 		     n = node_map_next(rstate->nodes, &it)) {
-			size_t num_edges = tal_count(n->in);
+			size_t num_edges = tal_count(n->chans);
 			for (i = 0; i < num_edges; i++) {
+				struct chan *chan = n->chans[i];
+				int idx = half_chan_to(n, chan);
+
 				SUPERVERBOSE("Node %s edge %i/%zu",
-					     type_to_string(trc, struct pubkey,
+					     type_to_string(tmpctx, struct pubkey,
 							    &n->id),
 					     i, num_edges);
-				if (!n->in[i]->active) {
-					SUPERVERBOSE("...inactive");
+
+				if (!hc_is_routable(&chan->half[idx], now)) {
+					SUPERVERBOSE("...unroutable");
 					continue;
 				}
-				bfg_one_edge(n, i, riskfactor);
+				bfg_one_edge(n, chan, idx,
+					     riskfactor, fuzz, base_seed);
 				SUPERVERBOSE("...done");
 			}
 		}
@@ -386,97 +428,52 @@ find_route(const tal_t *ctx, struct routing_state *rstate,
 	/* No route? */
 	if (dst->bfg[best].total >= INFINITE) {
 		status_trace("find_route: No route to %s",
-			     type_to_string(trc, struct pubkey, to));
+			     type_to_string(tmpctx, struct pubkey, to));
 		return NULL;
 	}
 
-	/* Save route from *next* hop (we return first hop as peer).
-	 * Note that we take our own fees into account for routing, even
-	 * though we don't pay them: it presumably effects preference. */
-	first_conn = dst->bfg[best].prev;
-	dst = dst->bfg[best].prev->dst;
-	best--;
+	/* We (dst) don't charge ourselves fees, so skip first hop */
+	n = other_node(dst, dst->bfg[best].prev);
+	*fee = n->bfg[best-1].total - msatoshi;
 
-	*fee = dst->bfg[best].total - msatoshi;
-	*route = tal_arr(ctx, struct node_connection *, best);
+	/* Lay out route */
+	route = tal_arr(ctx, struct chan *, best);
 	for (i = 0, n = dst;
 	     i < best;
-	     n = n->bfg[best-i].prev->dst, i++) {
-		(*route)[i] = n->bfg[best-i].prev;
+	     n = other_node(n, n->bfg[best-i].prev), i++) {
+		route[i] = n->bfg[best-i].prev;
 	}
 	assert(n == src);
 
-	msatoshi += *fee;
-	status_trace("find_route: via %s",
-		     type_to_string(trc, struct pubkey, &first_conn->dst->id));
-	/* If there are intermediaries, dump them, and total fees. */
-	if (best != 0) {
-		for (i = 0; i < best; i++) {
-			status_trace(" %s (%i+%i=%"PRIu64")",
-				     type_to_string(trc, struct pubkey,
-						    &(*route)[i]->dst->id),
-				     (*route)[i]->base_fee,
-				     (*route)[i]->proportional_fee,
-				     connection_fee((*route)[i], msatoshi));
-			msatoshi -= connection_fee((*route)[i], msatoshi);
-		}
-		status_trace(" =%"PRIi64"(%+"PRIi64")",
-			     (*route)[best-1]->dst->bfg[best-1].total, *fee);
-	}
-	return first_conn;
-}
-
-static struct node_connection *
-add_channel_direction(struct routing_state *rstate, const struct pubkey *from,
-		      const struct pubkey *to,
-		      const struct short_channel_id *short_channel_id,
-		      const u8 *announcement)
-{
-	struct node_connection *c1, *c2, *c;
-	u16 direction = get_channel_direction(from, to);
-
-	c1 = get_connection(rstate, from, to);
-	c2 = get_connection_by_scid(rstate, short_channel_id, direction);
-	if(c2) {
-		/* We already know the channel by its scid, just
-		 * update the announcement below */
-		c = c2;
-	} else if (c2) {
-		/* We found the channel by its endpoints, not by scid,
-		 * so update its scid */
-		memcpy(&c1->short_channel_id, short_channel_id,
-		       sizeof(c->short_channel_id));
-		c1->flags = direction;
-		c = c1;
-	} else {
-		/* We don't know this channel at all, create it */
-		c = half_add_connection(rstate, from, to, short_channel_id, direction);
-	}
-
-	/* Remember the announcement so we can forward it to new peers */
-	if (announcement) {
-		tal_free(c->channel_announcement);
-		c->channel_announcement = tal_dup_arr(c, u8, announcement,
-						      tal_count(announcement), 0);
-	}
-
-	return c;
+	return route;
 }
 
 /* Verify the signature of a channel_update message */
-static bool check_channel_update(const struct pubkey *node_key,
-				 const secp256k1_ecdsa_signature *node_sig,
-				 const u8 *update)
+static u8 *check_channel_update(const tal_t *ctx,
+				const struct pubkey *node_key,
+				const secp256k1_ecdsa_signature *node_sig,
+				const u8 *update)
 {
 	/* 2 byte msg type + 64 byte signatures */
 	int offset = 66;
 	struct sha256_double hash;
 	sha256_double(&hash, update + offset, tal_len(update) - offset);
 
-	return check_signed_hash(&hash, node_sig, node_key);
+	if (!check_signed_hash(&hash, node_sig, node_key))
+		return towire_errorfmt(ctx, NULL,
+				       "Bad signature for %s hash %s"
+				       " on channel_update %s",
+				       type_to_string(ctx,
+						      secp256k1_ecdsa_signature,
+						      node_sig),
+				       type_to_string(ctx,
+						      struct sha256_double,
+						      &hash),
+				       tal_hex(ctx, update));
+	return NULL;
 }
 
-static bool check_channel_announcement(
+static u8 *check_channel_announcement(const tal_t *ctx,
     const struct pubkey *node1_key, const struct pubkey *node2_key,
     const struct pubkey *bitcoin1_key, const struct pubkey *bitcoin2_key,
     const secp256k1_ecdsa_signature *node1_sig,
@@ -490,50 +487,181 @@ static bool check_channel_announcement(
 	sha256_double(&hash, announcement + offset,
 		      tal_len(announcement) - offset);
 
-	return check_signed_hash(&hash, node1_sig, node1_key) &&
-	       check_signed_hash(&hash, node2_sig, node2_key) &&
-	       check_signed_hash(&hash, bitcoin1_sig, bitcoin1_key) &&
-	       check_signed_hash(&hash, bitcoin2_sig, bitcoin2_key);
+	if (!check_signed_hash(&hash, node1_sig, node1_key)) {
+		return towire_errorfmt(ctx, NULL,
+				       "Bad node_signature_1 %s hash %s"
+				       " on node_announcement %s",
+				       type_to_string(ctx,
+						      secp256k1_ecdsa_signature,
+						      node1_sig),
+				       type_to_string(ctx,
+						      struct sha256_double,
+						      &hash),
+				       tal_hex(ctx, announcement));
+	}
+	if (!check_signed_hash(&hash, node2_sig, node2_key)) {
+		return towire_errorfmt(ctx, NULL,
+				       "Bad node_signature_2 %s hash %s"
+				       " on node_announcement %s",
+				       type_to_string(ctx,
+						      secp256k1_ecdsa_signature,
+						      node2_sig),
+				       type_to_string(ctx,
+						      struct sha256_double,
+						      &hash),
+				       tal_hex(ctx, announcement));
+	}
+	if (!check_signed_hash(&hash, bitcoin1_sig, bitcoin1_key)) {
+		return towire_errorfmt(ctx, NULL,
+				       "Bad bitcoin_signature_1 %s hash %s"
+				       " on node_announcement %s",
+				       type_to_string(ctx,
+						      secp256k1_ecdsa_signature,
+						      bitcoin1_sig),
+				       type_to_string(ctx,
+						      struct sha256_double,
+						      &hash),
+				       tal_hex(ctx, announcement));
+	}
+	if (!check_signed_hash(&hash, bitcoin2_sig, bitcoin2_key)) {
+		return towire_errorfmt(ctx, NULL,
+				       "Bad bitcoin_signature_2 %s hash %s"
+				       " on node_announcement %s",
+				       type_to_string(ctx,
+						      secp256k1_ecdsa_signature,
+						      bitcoin2_sig),
+				       type_to_string(ctx,
+						      struct sha256_double,
+						      &hash),
+				       tal_hex(ctx, announcement));
+	}
+	return NULL;
 }
 
-bool handle_channel_announcement(
-	struct routing_state *rstate,
-	const u8 *announce)
+static void add_pending_node_announcement(struct routing_state *rstate, struct pubkey *nodeid)
 {
-	u8 *serialized;
-	bool forward = false, local, sigfail;
-	secp256k1_ecdsa_signature node_signature_1;
-	secp256k1_ecdsa_signature node_signature_2;
-	struct short_channel_id short_channel_id;
-	secp256k1_ecdsa_signature bitcoin_signature_1;
-	secp256k1_ecdsa_signature bitcoin_signature_2;
-	struct pubkey node_id_1;
-	struct pubkey node_id_2;
-	struct pubkey bitcoin_key_1;
-	struct pubkey bitcoin_key_2;
-	struct bitcoin_blkid chain_hash;
-	struct node_connection *c0, *c1;
-	const tal_t *tmpctx = tal_tmpctx(rstate);
-	u8 *features;
-	char *tag;
-	size_t len = tal_len(announce);
+	struct pending_node_announce *pna = tal(rstate, struct pending_node_announce);
+	pna->nodeid = *nodeid;
+	pna->node_announcement = NULL;
+	pna->timestamp = 0;
+	pending_node_map_add(rstate->pending_node_map, pna);
+}
 
-	serialized = tal_dup_arr(tmpctx, u8, announce, len, 0);
-	if (!fromwire_channel_announcement(tmpctx, serialized, NULL,
-					   &node_signature_1, &node_signature_2,
+static void process_pending_node_announcement(struct routing_state *rstate,
+					      struct pubkey *nodeid)
+{
+	struct pending_node_announce *pna = pending_node_map_get(rstate->pending_node_map, &nodeid->pubkey);
+	if (!pna)
+		return;
+
+	if (pna->node_announcement) {
+		u8 *err;
+		SUPERVERBOSE(
+		    "Processing deferred node_announcement for node %s",
+		    type_to_string(pna, struct pubkey, nodeid));
+
+		/* Should not error, since we processed it before */
+		err = handle_node_announcement(rstate, pna->node_announcement);
+		if (err)
+			status_failed(STATUS_FAIL_INTERNAL_ERROR,
+				      "pending node_announcement %s malformed %s?",
+				      tal_hex(tmpctx, pna->node_announcement),
+				      sanitize_error(tmpctx, err, NULL));
+	}
+	pending_node_map_del(rstate->pending_node_map, pna);
+	tal_free(pna);
+}
+
+static struct pending_cannouncement *
+find_pending_cannouncement(struct routing_state *rstate,
+			   const struct short_channel_id *scid)
+{
+	struct pending_cannouncement *i;
+
+	list_for_each(&rstate->pending_cannouncement, i, list) {
+		if (structeq(scid, &i->short_channel_id))
+			return i;
+	}
+	return NULL;
+}
+
+static void destroy_pending_cannouncement(struct pending_cannouncement *pending,
+					  struct routing_state *rstate)
+{
+	list_del_from(&rstate->pending_cannouncement, &pending->list);
+}
+
+u8 *handle_channel_announcement(struct routing_state *rstate,
+				const u8 *announce TAKES,
+				const struct short_channel_id **scid)
+{
+	struct pending_cannouncement *pending;
+	struct bitcoin_blkid chain_hash;
+	u8 *features, *err;
+	secp256k1_ecdsa_signature node_signature_1, node_signature_2;
+	secp256k1_ecdsa_signature bitcoin_signature_1, bitcoin_signature_2;
+	struct chan *chan;
+
+	pending = tal(rstate, struct pending_cannouncement);
+	pending->updates[0] = NULL;
+	pending->updates[1] = NULL;
+	pending->announce = tal_dup_arr(pending, u8,
+					announce, tal_len(announce), 0);
+	pending->update_timestamps[0] = pending->update_timestamps[1] = 0;
+
+	if (!fromwire_channel_announcement(pending, pending->announce,
+					   &node_signature_1,
+					   &node_signature_2,
 					   &bitcoin_signature_1,
 					   &bitcoin_signature_2,
 					   &features,
 					   &chain_hash,
-					   &short_channel_id,
-					   &node_id_1, &node_id_2,
-					   &bitcoin_key_1, &bitcoin_key_2)) {
-		tal_free(tmpctx);
-		return false;
+					   &pending->short_channel_id,
+					   &pending->node_id_1,
+					   &pending->node_id_2,
+					   &pending->bitcoin_key_1,
+					   &pending->bitcoin_key_2)) {
+		err = towire_errorfmt(rstate, NULL,
+				      "Malformed channel_announcement %s",
+				      tal_hex(pending, pending->announce));
+		goto malformed;
 	}
 
-	tag = type_to_string(tmpctx, struct short_channel_id,
-			     &short_channel_id);
+	/* Check if we know the channel already (no matter in what
+	 * state, we stop here if yes). */
+	chan = get_channel(rstate, &pending->short_channel_id);
+	if (chan != NULL && chan->public) {
+		SUPERVERBOSE("%s: %s already has public channel",
+			     __func__,
+			     type_to_string(tmpctx, struct short_channel_id,
+					    &pending->short_channel_id));
+		goto ignored;
+	}
+
+	/* We don't replace previous ones, since we might validate that and
+	 * think this one is OK! */
+	if (find_pending_cannouncement(rstate, &pending->short_channel_id)) {
+		SUPERVERBOSE("%s: %s already has pending cannouncement",
+			     __func__,
+			     type_to_string(tmpctx, struct short_channel_id,
+					    &pending->short_channel_id));
+		goto ignored;
+	}
+
+	/* FIXME: Handle duplicates as per BOLT #7 */
+
+	/* BOLT #7:
+	 *
+	 * If there is an unknown even bit in the `features` field the
+	 * receiving node MUST NOT parse the remainder of the message
+	 * and MUST NOT add the channel to its local network view, and
+	 * SHOULD NOT forward the announcement.
+	 */
+	if (!features_supported(features, NULL)) {
+		status_trace("Ignoring channel announcement, unsupported features %s.",
+			     tal_hex(pending, features));
+		goto ignored;
+	}
 
 	/* BOLT #7:
 	 *
@@ -543,62 +671,220 @@ bool handle_channel_announcement(
 	if (!structeq(&chain_hash, &rstate->chain_hash)) {
 		status_trace(
 		    "Received channel_announcement %s for unknown chain %s",
-		    tag,
-		    type_to_string(tmpctx, struct bitcoin_blkid, &chain_hash));
-		tal_free(tmpctx);
-		return false;
+		    type_to_string(pending, struct short_channel_id,
+				   &pending->short_channel_id),
+		    type_to_string(pending, struct bitcoin_blkid, &chain_hash));
+		goto ignored;
 	}
 
-	// FIXME: Check features!
-	//FIXME(cdecker) Check chain topology for the anchor TX
-
-	local = pubkey_eq(&node_id_1, &rstate->local_id) ||
-		pubkey_eq(&node_id_2, &rstate->local_id);
-
-	sigfail = !check_channel_announcement(
-	    &node_id_1, &node_id_2, &bitcoin_key_1, &bitcoin_key_2,
-	    &node_signature_1, &node_signature_2, &bitcoin_signature_1,
-	    &bitcoin_signature_2, serialized);
-
-	status_trace("Received channel_announcement for channel %s, local=%d, sigfail=%d",
-		     tag, local, sigfail);
-
-	if (sigfail) {
-		status_trace(
-			"Signature verification of channel_announcement for %s failed", tag);
-		tal_free(tmpctx);
-		return false;
+	err = check_channel_announcement(rstate,
+					 &pending->node_id_1,
+					 &pending->node_id_2,
+					 &pending->bitcoin_key_1,
+					 &pending->bitcoin_key_2,
+					 &node_signature_1,
+					 &node_signature_2,
+					 &bitcoin_signature_1,
+					 &bitcoin_signature_2,
+					 pending->announce);
+	if (err) {
+		/* BOLT #7:
+		 *
+		 * - if `bitcoin_signature_1`, `bitcoin_signature_2`,
+		 *   `node_signature_1` OR `node_signature_2` are invalid OR NOT
+		 *    correct:
+		 *    - SHOULD fail the connection.
+		 */
+		goto malformed;
 	}
 
-	/* Is this a new connection? It is if we don't know the
-	 * channel yet, or do not have a matching announcement in the
-	 * case of side-loaded channels*/
-	c0 = get_connection_by_scid(rstate, &short_channel_id, 0);
-	c1 = get_connection_by_scid(rstate, &short_channel_id, 1);
-	forward = !c0 || !c1 || !c0->channel_announcement || !c1->channel_announcement;
+	status_trace("Received channel_announcement for channel %s",
+		     type_to_string(pending, struct short_channel_id,
+				    &pending->short_channel_id));
 
-	add_channel_direction(rstate, &node_id_1, &node_id_2, &short_channel_id,
-			      serialized);
-	add_channel_direction(rstate, &node_id_2, &node_id_1, &short_channel_id,
-			      serialized);
+	/* Add both endpoints to the pending_node_map so we can stash
+	 * node_announcements while we wait for the txout check */
+	add_pending_node_announcement(rstate, &pending->node_id_1);
+	add_pending_node_announcement(rstate, &pending->node_id_2);
 
-	if (forward) {
-		if (queue_broadcast(rstate->broadcasts,
-				    WIRE_CHANNEL_ANNOUNCEMENT,
-				    (u8*)tag, serialized))
-			status_failed(STATUS_FAIL_INTERNAL_ERROR,
-				      "Announcemnet %s was replaced?",
-				      tal_hex(trc, serialized));
-	}
+	list_add_tail(&rstate->pending_cannouncement, &pending->list);
+	tal_add_destructor2(pending, destroy_pending_cannouncement, rstate);
 
-	tal_free(tmpctx);
-	return local && forward;
+	/* Success */
+	*scid = &pending->short_channel_id;
+	return NULL;
+
+malformed:
+	tal_free(pending);
+	*scid = NULL;
+	return err;
+
+ignored:
+	tal_free(pending);
+	*scid = NULL;
+	return NULL;
 }
 
-void handle_channel_update(struct routing_state *rstate, const u8 *update)
+static void process_pending_channel_update(struct routing_state *rstate,
+					   const struct short_channel_id *scid,
+					   const u8 *cupdate)
+{
+	u8 *err;
+
+	if (!cupdate)
+		return;
+
+	/* FIXME: We don't remember who sent us updates, so can't error them */
+	err = handle_channel_update(rstate, cupdate);
+	if (err) {
+		status_trace("Pending channel_update for %s: %s",
+			     type_to_string(tmpctx, struct short_channel_id, scid),
+			     sanitize_error(tmpctx, err, NULL));
+		tal_free(err);
+	}
+}
+
+bool handle_pending_cannouncement(struct routing_state *rstate,
+				  const struct short_channel_id *scid,
+				  const u64 satoshis,
+				  const u8 *outscript)
+{
+	bool local;
+	const u8 *s;
+	struct pending_cannouncement *pending;
+	struct chan *chan;
+
+	pending = find_pending_cannouncement(rstate, scid);
+	if (!pending)
+		return false;
+
+	/* BOLT #7:
+	 *
+	 * The receiving node MUST ignore the message if this output is spent.
+	 */
+	if (tal_len(outscript) == 0) {
+		status_trace("channel_announcement: no unspent txout %s",
+			     type_to_string(pending, struct short_channel_id,
+					    scid));
+		tal_free(pending);
+		return false;
+	}
+
+	/* BOLT #7:
+	 *
+	 * The receiving node MUST ignore the message if the output
+	 * specified by `short_channel_id` does not correspond to a
+	 * P2WSH using `bitcoin_key_1` and `bitcoin_key_2` as
+	 * specified in [BOLT
+	 * #3](03-transactions.md#funding-transaction-output).
+	 */
+	s = scriptpubkey_p2wsh(pending,
+			       bitcoin_redeem_2of2(pending,
+						   &pending->bitcoin_key_1,
+						   &pending->bitcoin_key_2));
+
+	if (!scripteq(s, outscript)) {
+		status_trace("channel_announcement: txout %s expectes %s, got %s",
+			     type_to_string(pending, struct short_channel_id,
+					    scid),
+			     tal_hex(tmpctx, s), tal_hex(tmpctx, outscript));
+		tal_free(pending);
+		return false;
+	}
+
+	/* The channel may already exist if it was non-public from
+	 * local_add_channel(); normally we don't accept new
+	 * channel_announcements.  See handle_channel_announcement. */
+	chan = get_channel(rstate, scid);
+	if (!chan)
+		chan = new_chan(rstate, scid,
+					   &pending->node_id_1,
+					   &pending->node_id_2);
+
+	/* Channel is now public. */
+	chan->public = true;
+	chan->satoshis = satoshis;
+
+	if (replace_broadcast(chan, rstate->broadcasts,
+			      &chan->channel_announce_msgidx,
+			      take(pending->announce)))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Announcement %s was replaced?",
+			      tal_hex(tmpctx, pending->announce));
+
+	local = pubkey_eq(&pending->node_id_1, &rstate->local_id) ||
+		pubkey_eq(&pending->node_id_2, &rstate->local_id);
+
+	/* Did we have an update waiting?  If so, apply now. */
+	process_pending_channel_update(rstate, scid, pending->updates[0]);
+	process_pending_channel_update(rstate, scid, pending->updates[1]);
+
+	process_pending_node_announcement(rstate, &pending->node_id_1);
+	process_pending_node_announcement(rstate, &pending->node_id_2);
+
+	tal_free(pending);
+	return local;
+}
+
+static void update_pending(struct pending_cannouncement *pending,
+			   u32 timestamp, const u8 *update,
+			   const u8 direction)
+{
+	SUPERVERBOSE("Deferring update for pending channel %s(%d)",
+		     type_to_string(tmpctx, struct short_channel_id,
+				    &pending->short_channel_id), direction);
+
+	if (pending->update_timestamps[direction] < timestamp) {
+		if (pending->updates[direction]) {
+			status_trace("Replacing existing update");
+			tal_free(pending->updates[direction]);
+		}
+		pending->updates[direction] = tal_dup_arr(pending, u8, update, tal_len(update), 0);
+		pending->update_timestamps[direction] = timestamp;
+	}
+}
+
+void set_connection_values(struct chan *chan,
+			   int idx,
+			   u32 base_fee,
+			   u32 proportional_fee,
+			   u32 delay,
+			   bool active,
+			   u64 timestamp,
+			   u32 htlc_minimum_msat)
+{
+	struct half_chan *c = &chan->half[idx];
+
+	c->delay = delay;
+	c->htlc_minimum_msat = htlc_minimum_msat;
+	c->base_fee = base_fee;
+	c->proportional_fee = proportional_fee;
+	c->active = active;
+	c->last_timestamp = timestamp;
+	assert((c->flags & 0x1) == idx);
+
+	/* If it was temporarily unroutable, re-enable */
+	c->unroutable_until = 0;
+
+	SUPERVERBOSE("Channel %s(%d) was updated.",
+		     type_to_string(tmpctx, struct short_channel_id, &chan->scid),
+		     idx);
+
+	if (c->proportional_fee >= MAX_PROPORTIONAL_FEE) {
+		status_trace("Channel %s(%d) massive proportional fee %u:"
+			     " disabling.",
+			     type_to_string(tmpctx, struct short_channel_id,
+					    &chan->scid),
+			     idx,
+			     c->proportional_fee);
+		c->active = false;
+	}
+}
+
+u8 *handle_channel_update(struct routing_state *rstate, const u8 *update)
 {
 	u8 *serialized;
-	struct node_connection *c;
+	struct half_chan *c;
 	secp256k1_ecdsa_signature signature;
 	struct short_channel_id short_channel_id;
 	u32 timestamp;
@@ -607,19 +893,24 @@ void handle_channel_update(struct routing_state *rstate, const u8 *update)
 	u64 htlc_minimum_msat;
 	u32 fee_base_msat;
 	u32 fee_proportional_millionths;
-	const tal_t *tmpctx = tal_tmpctx(rstate);
 	struct bitcoin_blkid chain_hash;
+	struct chan *chan;
+	u8 direction;
 	size_t len = tal_len(update);
+	u8 *err;
 
 	serialized = tal_dup_arr(tmpctx, u8, update, len, 0);
-	if (!fromwire_channel_update(serialized, NULL, &signature,
+	if (!fromwire_channel_update(serialized, &signature,
 				     &chain_hash, &short_channel_id,
 				     &timestamp, &flags, &expiry,
 				     &htlc_minimum_msat, &fee_base_msat,
 				     &fee_proportional_millionths)) {
-		tal_free(tmpctx);
-		return;
+		err = towire_errorfmt(rstate, NULL,
+				      "Malformed channel_update %s",
+				      tal_hex(tmpctx, serialized));
+		return err;
 	}
+	direction = flags & 0x1;
 
 	/* BOLT #7:
 	 *
@@ -630,66 +921,71 @@ void handle_channel_update(struct routing_state *rstate, const u8 *update)
 		status_trace("Received channel_update for unknown chain %s",
 			     type_to_string(tmpctx, struct bitcoin_blkid,
 					    &chain_hash));
-		tal_free(tmpctx);
-		return;
+		return NULL;
 	}
 
-	status_trace("Received channel_update for channel %s(%d)",
-		     type_to_string(trc, struct short_channel_id,
+	chan = get_channel(rstate, &short_channel_id);
+
+	/* Optimization: only check for pending if not public */
+	if (!chan || !chan->public) {
+		struct pending_cannouncement *pending;
+
+		pending = find_pending_cannouncement(rstate, &short_channel_id);
+		if (pending) {
+			update_pending(pending,
+				       timestamp, serialized, direction);
+			return NULL;
+		}
+
+		if (!chan) {
+			SUPERVERBOSE("Ignoring update for unknown channel %s",
+				     type_to_string(tmpctx, struct short_channel_id,
+						    &short_channel_id));
+			return NULL;
+		}
+	}
+
+	c = &chan->half[direction];
+
+	if (c->last_timestamp >= timestamp) {
+		SUPERVERBOSE("Ignoring outdated update.");
+		return NULL;
+	}
+
+	err = check_channel_update(rstate, &chan->nodes[direction]->id,
+				   &signature, serialized);
+	if (err) {
+		/* BOLT #7:
+		 *
+		 * - if `signature` is not a valid signature, using `node_id`
+		 *  of the double-SHA256 of the entire message following the
+		 *  `signature` field (including unknown fields following
+		 *  `fee_proportional_millionths`):
+		 *    - MUST NOT process the message further.
+		 *    - SHOULD fail the connection.
+		 */
+		return err;
+	}
+
+	status_trace("Received channel_update for channel %s(%d) now %s",
+		     type_to_string(tmpctx, struct short_channel_id,
 				    &short_channel_id),
-		     flags & 0x01);
+		     flags & 0x01,
+		     flags & ROUTING_FLAGS_DISABLED ? "DISABLED" : "ACTIVE");
 
-	c = get_connection_by_scid(rstate, &short_channel_id, flags & 0x1);
+	set_connection_values(chan, direction,
+			      fee_base_msat,
+			      fee_proportional_millionths,
+			      expiry,
+			      (flags & ROUTING_FLAGS_DISABLED) == 0,
+			      timestamp,
+			      htlc_minimum_msat);
 
-	if (!c) {
-		status_trace("Ignoring update for unknown channel %s",
-			     type_to_string(trc, struct short_channel_id,
-					    &short_channel_id));
-		tal_free(tmpctx);
-		return;
-	} else if (c->last_timestamp >= timestamp) {
-		status_trace("Ignoring outdated update.");
-		tal_free(tmpctx);
-		return;
-	} else if (!check_channel_update(&c->src->id, &signature, serialized)) {
-		status_trace("Signature verification failed.");
-		tal_free(tmpctx);
-		return;
-	}
+	replace_broadcast(chan, rstate->broadcasts,
+			  &chan->half[direction].channel_update_msgidx,
+			  take(serialized));
 
-	//FIXME(cdecker) Check signatures
-	c->last_timestamp = timestamp;
-	c->delay = expiry;
-	c->htlc_minimum_msat = htlc_minimum_msat;
-	c->base_fee = fee_base_msat;
-	c->proportional_fee = fee_proportional_millionths;
-	c->active = (flags & ROUTING_FLAGS_DISABLED) == 0;
-	status_trace("Channel %s(%d) was updated.",
-		     type_to_string(trc, struct short_channel_id,
-				    &short_channel_id),
-		     flags);
-
-	if (c->proportional_fee >= MAX_PROPORTIONAL_FEE) {
-		status_trace("Channel %s(%d) massive proportional fee %u:"
-			     " disabling.",
-			     type_to_string(trc, struct short_channel_id,
-					    &short_channel_id),
-			     flags,
-			     fee_proportional_millionths);
-		c->active = false;
-	}
-
-	u8 *tag = tal_arr(tmpctx, u8, 0);
-	towire_short_channel_id(&tag, &short_channel_id);
-	towire_u16(&tag, flags & 0x1);
-	queue_broadcast(rstate->broadcasts,
-			WIRE_CHANNEL_UPDATE,
-			tag,
-			serialized);
-
-	tal_free(c->channel_update);
-	c->channel_update = tal_steal(c, serialized);
-	tal_free(tmpctx);
+	return NULL;
 }
 
 static struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser)
@@ -726,8 +1022,7 @@ static struct wireaddr *read_addresses(const tal_t *ctx, const u8 *ser)
 	return wireaddrs;
 }
 
-void handle_node_announcement(
-	struct routing_state *rstate, const u8 *node_ann)
+u8 *handle_node_announcement(struct routing_state *rstate, const u8 *node_ann)
 {
 	u8 *serialized;
 	struct sha256_double hash;
@@ -738,108 +1033,357 @@ void handle_node_announcement(
 	u8 rgb_color[3];
 	u8 alias[32];
 	u8 *features, *addresses;
-	const tal_t *tmpctx = tal_tmpctx(rstate);
 	struct wireaddr *wireaddrs;
+	struct pending_node_announce *pna;
 	size_t len = tal_len(node_ann);
 
 	serialized = tal_dup_arr(tmpctx, u8, node_ann, len, 0);
-	if (!fromwire_node_announcement(tmpctx, serialized, NULL,
+	if (!fromwire_node_announcement(tmpctx, serialized,
 					&signature, &features, &timestamp,
 					&node_id, rgb_color, alias,
 					&addresses)) {
-		tal_free(tmpctx);
-		return;
+		/* BOLT #7:
+		 *
+		 *   - if `node_id` is NOT a valid compressed public key:
+		 *    - SHOULD fail the connection.
+		 *    - MUST NOT process the message further.
+		 */
+		u8 *err = towire_errorfmt(rstate, NULL,
+					  "Malformed node_announcement %s",
+					  tal_hex(tmpctx, node_ann));
+		return err;
 	}
 
-	// FIXME: Check features!
-	status_trace("Received node_announcement for node %s",
-		     type_to_string(trc, struct pubkey, &node_id));
+	/* BOLT #7:
+	 *
+	 * If the `features` field contains unknown even bits the
+	 * receiving node MUST NOT parse the remainder of the message
+	 * and MAY discard the message altogether.
+	 */
+	if (!features_supported(features, NULL)) {
+		status_trace("Ignoring node announcement for node %s, unsupported features %s.",
+			     type_to_string(tmpctx, struct pubkey, &node_id),
+			     tal_hex(tmpctx, features));
+		return NULL;
+	}
 
 	sha256_double(&hash, serialized + 66, tal_count(serialized) - 66);
 	if (!check_signed_hash(&hash, &signature, &node_id)) {
-		status_trace("Ignoring node announcement, signature verification failed.");
-		tal_free(tmpctx);
-		return;
-	}
-	node = get_node(rstate, &node_id);
-
-	if (!node) {
-		status_trace("Node not found, was the node_announcement preceded by at least channel_announcement?");
-		tal_free(tmpctx);
-		return;
-	} else if (node->last_timestamp >= timestamp) {
-		status_trace("Ignoring node announcement, it's outdated.");
-		tal_free(tmpctx);
-		return;
+		/* BOLT #7:
+		 *
+		 * - if `signature` is NOT a valid signature (using `node_id`
+		 *  of the double-SHA256 of the entire message following the
+		 *  `signature` field, including unknown fields following
+		 *  `alias`):
+		 *    - SHOULD fail the connection.
+		 *    - MUST NOT process the message further.
+		 */
+		u8 *err = towire_errorfmt(rstate, NULL,
+					  "Bad signature for %s hash %s"
+					  " on node_announcement %s",
+					  type_to_string(tmpctx,
+							 secp256k1_ecdsa_signature,
+							 &signature),
+					  type_to_string(tmpctx,
+							 struct sha256_double,
+							 &hash),
+					  tal_hex(tmpctx, node_ann));
+		return err;
 	}
 
 	wireaddrs = read_addresses(tmpctx, addresses);
 	if (!wireaddrs) {
-		status_trace("Unable to parse addresses.");
-		tal_free(serialized);
-		return;
+		/* BOLT #7:
+		 *
+		 * - if `addrlen` is insufficient to hold the address
+		 *  descriptors of the known types:
+		 *    - SHOULD fail the connection.
+		 */
+		u8 *err = towire_errorfmt(rstate, NULL,
+					  "Malformed wireaddrs %s in %s.",
+					  tal_hex(tmpctx, wireaddrs),
+					  tal_hex(tmpctx, node_ann));
+		return err;
 	}
+
+	/* Beyond this point it's not malformed, so safe if we make it
+	 * pending and requeue later. */
+	node = get_node(rstate, &node_id);
+
+	/* Check if we are currently verifying the txout for a
+	 * matching channel */
+	pna = pending_node_map_get(rstate->pending_node_map, &node_id.pubkey);
+	if (!node && pna) {
+		if (pna->timestamp < timestamp) {
+			SUPERVERBOSE(
+			    "Deferring node_announcement for node %s",
+			    type_to_string(tmpctx, struct pubkey, &node_id));
+			pna->timestamp = timestamp;
+			tal_free(pna->node_announcement);
+			pna->node_announcement = tal_dup_arr(pna, u8, node_ann, tal_len(node_ann), 0);
+		}
+		return NULL;
+	}
+
+	/* BOLT #7:
+	 *
+	 * - if `node_id` is NOT previously known from a
+	 *   `channel_announcement` message, OR if `timestamp` is NOT greater
+	 *   than the last-received `node_announcement` from this `node_id`:
+	 *    - SHOULD ignore the message.
+	 */
+	if (!node) {
+		SUPERVERBOSE("Node not found, was the node_announcement for "
+			     "node %s preceded by at least "
+			     "channel_announcement?",
+			     type_to_string(tmpctx, struct pubkey, &node_id));
+		return NULL;
+	} else if (node->last_timestamp >= timestamp) {
+		SUPERVERBOSE("Ignoring node announcement, it's outdated.");
+		return NULL;
+	}
+
+	status_trace("Received node_announcement for node %s",
+		     type_to_string(tmpctx, struct pubkey, &node_id));
+
 	tal_free(node->addresses);
 	node->addresses = tal_steal(node, wireaddrs);
 
 	node->last_timestamp = timestamp;
 
 	memcpy(node->rgb_color, rgb_color, 3);
+	tal_free(node->alias);
+	node->alias = tal_dup_arr(node, u8, alias, 32, 0);
 
-	u8 *tag = tal_arr(tmpctx, u8, 0);
-	towire_pubkey(&tag, &node_id);
-	queue_broadcast(rstate->broadcasts,
-			WIRE_NODE_ANNOUNCEMENT,
-			tag,
-			serialized);
-	tal_free(node->node_announcement);
-	node->node_announcement = tal_steal(node, serialized);
-	tal_free(tmpctx);
+	replace_broadcast(node, rstate->broadcasts,
+			  &node->node_announce_msgidx,
+			  take(serialized));
+	return NULL;
 }
 
-struct route_hop *get_route(tal_t *ctx, struct routing_state *rstate,
+struct route_hop *get_route(const tal_t *ctx, struct routing_state *rstate,
 			    const struct pubkey *source,
 			    const struct pubkey *destination,
 			    const u32 msatoshi, double riskfactor,
-			    u32 final_cltv)
+			    u32 final_cltv,
+			    double fuzz, const struct siphash_seed *base_seed)
 {
-	struct node_connection **route;
+	struct chan **route;
 	u64 total_amount;
 	unsigned int total_delay;
 	u64 fee;
 	struct route_hop *hops;
 	int i;
-	struct node_connection *first_conn;
+	struct node *n;
 
-	first_conn = find_route(ctx, rstate, source, destination, msatoshi,
-				riskfactor / BLOCKS_PER_YEAR / 10000,
-				&fee, &route);
+	route = find_route(ctx, rstate, source, destination, msatoshi,
+			   riskfactor / BLOCKS_PER_YEAR / 10000,
+			   fuzz, base_seed, &fee);
 
-	if (!first_conn) {
+	if (!route) {
 		return NULL;
 	}
 
 	/* Fees, delays need to be calculated backwards along route. */
-	hops = tal_arr(ctx, struct route_hop, tal_count(route) + 1);
+	hops = tal_arr(ctx, struct route_hop, tal_count(route));
 	total_amount = msatoshi;
 	total_delay = final_cltv;
 
+	/* Start at destination node. */
+	n = get_node(rstate, destination);
 	for (i = tal_count(route) - 1; i >= 0; i--) {
-		hops[i + 1].channel_id = route[i]->short_channel_id;
-		hops[i + 1].nodeid = route[i]->dst->id;
-		hops[i + 1].amount = total_amount;
-		total_amount += connection_fee(route[i], total_amount);
-
-		hops[i + 1].delay = total_delay;
-		total_delay += route[i]->delay;
+		const struct half_chan *c;
+		int idx = half_chan_to(n, route[i]);
+		c = &route[i]->half[idx];
+		hops[i].channel_id = route[i]->scid;
+		hops[i].nodeid = n->id;
+		hops[i].amount = total_amount;
+		hops[i].delay = total_delay;
+		total_amount += connection_fee(c, total_amount);
+		total_delay += c->delay;
+		n = other_node(n, route[i]);
 	}
-	/* Backfill the first hop manually */
-	hops[0].channel_id = first_conn->short_channel_id;
-	hops[0].nodeid = first_conn->dst->id;
-	/* We don't charge ourselves any fees, nor require delay */
-	hops[0].amount = total_amount;
-	hops[0].delay = total_delay;
+	assert(pubkey_eq(&n->id, source));
 
 	/* FIXME: Shadow route! */
 	return hops;
+}
+
+/**
+ * routing_failure_channel_out - Handle routing failure on a specific channel
+ *
+ * If we want to delete the channel, we reparent it to disposal_context.
+ */
+static void routing_failure_channel_out(const tal_t *disposal_context,
+					struct node *node,
+					enum onion_type failcode,
+					struct chan *chan,
+					time_t now)
+{
+	struct half_chan *hc = half_chan_from(node, chan);
+
+	/* BOLT #4:
+	 *
+	 * - if the PERM bit is NOT set:
+	 *   - SHOULD restore the channels as it receives new `channel_update`s.
+	 */
+	if (!(failcode & PERM))
+		/* Prevent it for 20 seconds. */
+		hc->unroutable_until = now + 20;
+	else
+		/* Set it up to be pruned. */
+		tal_steal(disposal_context, chan);
+}
+
+void routing_failure(struct routing_state *rstate,
+		     const struct pubkey *erring_node_pubkey,
+		     const struct short_channel_id *scid,
+		     enum onion_type failcode,
+		     const u8 *channel_update)
+{
+	struct node *node;
+	int i;
+	time_t now = time_now().ts.tv_sec;
+
+	status_trace("Received routing failure 0x%04x (%s), "
+		     "erring node %s, "
+		     "channel %s",
+		     (int) failcode, onion_type_name(failcode),
+		     type_to_string(tmpctx, struct pubkey, erring_node_pubkey),
+		     type_to_string(tmpctx, struct short_channel_id, scid));
+
+	node = get_node(rstate, erring_node_pubkey);
+	if (!node) {
+		status_unusual("routing_failure: Erring node %s not in map",
+			       type_to_string(tmpctx, struct pubkey,
+					      erring_node_pubkey));
+		/* No node, so no channel, so any channel_update
+		 * can also be ignored. */
+		return;
+	}
+
+	/* BOLT #4:
+	 *
+	 * - if the NODE bit is set:
+	 *   - SHOULD remove all channels connected with the erring node from
+	 *   consideration.
+	 *
+	 */
+	if (failcode & NODE) {
+		for (i = 0; i < tal_count(node->chans); ++i) {
+			routing_failure_channel_out(tmpctx, node, failcode,
+						    node->chans[i],
+						    now);
+		}
+	} else {
+		struct chan *chan = get_channel(rstate, scid);
+
+		if (!chan)
+			status_unusual("routing_failure: "
+				       "Channel %s unknown",
+				       type_to_string(tmpctx,
+						      struct short_channel_id,
+						      scid));
+		else if (chan->nodes[0] != node && chan->nodes[1] != node)
+			status_unusual("routing_failure: "
+				       "Channel %s does not connect to %s",
+				       type_to_string(tmpctx,
+						      struct short_channel_id,
+						      scid),
+				       type_to_string(tmpctx, struct pubkey,
+						      erring_node_pubkey));
+		else
+			routing_failure_channel_out(tmpctx,
+						    node, failcode, chan, now);
+	}
+
+	/* Update the channel if UPDATE failcode. Do
+	 * this after deactivating, so that if the
+	 * channel_update is newer it will be
+	 * reactivated. */
+	if (failcode & UPDATE) {
+		u8 *err;
+		if (tal_len(channel_update) == 0) {
+			/* Suppress UNUSUAL log if local failure */
+			if (structeq(&erring_node_pubkey->pubkey,
+				     &rstate->local_id.pubkey))
+				return;
+			status_unusual("routing_failure: "
+				       "UPDATE bit set, no channel_update. "
+				       "failcode: 0x%04x",
+				       (int) failcode);
+			return;
+		}
+		err = handle_channel_update(rstate, channel_update);
+		if (err) {
+			status_unusual("routing_failure: "
+				       "bad channel_update %s",
+				       sanitize_error(err, err, NULL));
+			tal_free(err);
+			return;
+		}
+	} else {
+		if (tal_len(channel_update) != 0)
+			status_unusual("routing_failure: "
+				       "UPDATE bit clear, channel_update given. "
+				       "failcode: 0x%04x",
+				       (int) failcode);
+	}
+}
+
+void mark_channel_unroutable(struct routing_state *rstate,
+			     const struct short_channel_id *channel)
+{
+	struct chan *chan;
+	time_t now = time_now().ts.tv_sec;
+	const char *scid = type_to_string(tmpctx, struct short_channel_id,
+					  channel);
+
+	status_trace("Received mark_channel_unroutable channel %s",
+		     scid);
+
+	chan = get_channel(rstate, channel);
+	if (!chan) {
+		status_unusual("mark_channel_unroutable: "
+			       "channel %s not in routemap",
+			       scid);
+		return;
+	}
+	chan->half[0].unroutable_until = now + 20;
+	chan->half[1].unroutable_until = now + 20;
+}
+
+void route_prune(struct routing_state *rstate)
+{
+	u64 now = time_now().ts.tv_sec;
+	/* Anything below this highwater mark ought to be pruned */
+	const s64 highwater = now - rstate->prune_timeout;
+	const tal_t *pruned = tal(NULL, char);
+	struct chan *chan;
+	u64 idx;
+
+	/* Now iterate through all channels and see if it is still alive */
+	for (chan = uintmap_first(&rstate->chanmap, &idx);
+	     chan;
+	     chan = uintmap_after(&rstate->chanmap, &idx)) {
+		/* Local-only?  Don't prune. */
+		if (!chan->public)
+			continue;
+
+		if (chan->half[0].last_timestamp < highwater
+		    && chan->half[1].last_timestamp < highwater) {
+			status_trace(
+			    "Pruning channel %s from network view (ages %"PRIu64" and %"PRIu64"s)",
+			    type_to_string(tmpctx, struct short_channel_id,
+					   &chan->scid),
+			    now - chan->half[0].last_timestamp,
+			    now - chan->half[1].last_timestamp);
+
+			/* This may perturb iteration so do outside loop. */
+			tal_steal(pruned, chan);
+		}
+	}
+
+	/* This frees all the chans and maybe even nodes. */
+	tal_free(pruned);
 }

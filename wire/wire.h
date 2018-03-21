@@ -20,6 +20,10 @@ struct bitcoin_blkid;
 struct bitcoin_txid;
 struct preimage;
 struct ripemd160;
+struct siphash_seed;
+
+/* Makes generate-wire.py work */
+typedef char wirestring;
 
 void derive_channel_id(struct channel_id *channel_id,
 		       struct bitcoin_txid *txid, u16 txout);
@@ -49,16 +53,22 @@ void towire_u8(u8 **pptr, u8 v);
 void towire_u16(u8 **pptr, u16 v);
 void towire_u32(u8 **pptr, u32 v);
 void towire_u64(u8 **pptr, u64 v);
+void towire_double(u8 **pptr, const double *v);
 void towire_pad(u8 **pptr, size_t num);
 void towire_bool(u8 **pptr, bool v);
 
 void towire_u8_array(u8 **pptr, const u8 *arr, size_t num);
+
+void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx);
+void towire_wirestring(u8 **pptr, const char *str);
+void towire_siphash_seed(u8 **cursor, const struct siphash_seed *seed);
 
 const u8 *fromwire(const u8 **cursor, size_t *max, void *copy, size_t n);
 u8 fromwire_u8(const u8 **cursor, size_t *max);
 u16 fromwire_u16(const u8 **cursor, size_t *max);
 u32 fromwire_u32(const u8 **cursor, size_t *max);
 u64 fromwire_u64(const u8 **cursor, size_t *max);
+void fromwire_double(const u8 **cursor, size_t *max, double *v);
 bool fromwire_bool(const u8 **cursor, size_t *max);
 void fromwire_secret(const u8 **cursor, size_t *max, struct secret *secret);
 void fromwire_privkey(const u8 **cursor, size_t *max, struct privkey *privkey);
@@ -84,4 +94,9 @@ void fromwire_ripemd160(const u8 **cursor, size_t *max, struct ripemd160 *ripemd
 void fromwire_pad(const u8 **cursor, size_t *max, size_t num);
 
 void fromwire_u8_array(const u8 **cursor, size_t *max, u8 *arr, size_t num);
+char *fromwire_wirestring(const tal_t *ctx, const u8 **cursor, size_t *max);
+struct bitcoin_tx *fromwire_bitcoin_tx(const tal_t *ctx,
+				       const u8 **cursor, size_t *max);
+void fromwire_siphash_seed(const u8 **cursor, size_t *max,
+			   struct siphash_seed *seed);
 #endif /* LIGHTNING_WIRE_WIRE_H */

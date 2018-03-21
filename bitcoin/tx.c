@@ -80,29 +80,24 @@ static void push_witnesses(const struct bitcoin_tx *tx,
 
 static void push_tx(const struct bitcoin_tx *tx,
 		   void (*push)(const void *, size_t, void *), void *pushp,
-		   bool extended)
+		   bool bip144)
 {
 	varint_t i;
 	u8 flag = 0;
 
 	push_le32(tx->version, push, pushp);
 
-	if (extended) {
-		u8 marker;
+        if (bip144 && uses_witness(tx))
+		flag |= SEGREGATED_WITNESS_FLAG;
+
+	/* BIP 141: The flag MUST be a 1-byte non-zero value. */
+	/* ie. if no flags set, we fallback to pre-BIP144-style */
+	if (flag) {
+		u8 marker = 0;
 		/* BIP 144 */
 		/* marker 	char 	Must be zero */
 		/* flag 	char 	Must be nonzero */
-		marker = 0;
 		push(&marker, 1, pushp);
-		/* BIP 141: The flag MUST be a 1-byte non-zero
-		 * value. Currently, 0x01 MUST be used.
-		 *
-		 * BUT: Current segwit4 branch breaks fundrawtransaction;
-		 * it sees 0 inputs and thinks it's extended format.
-		 * Make it really an extended format, but without
-		 * witness. */
-		if (uses_witness(tx))
-			flag = SEGREGATED_WITNESS_FLAG;
 		push(&flag, 1, pushp);
 	}
 
@@ -256,23 +251,26 @@ static void push_linearize(const void *data, size_t len, void *pptr_)
 u8 *linearize_tx(const tal_t *ctx, const struct bitcoin_tx *tx)
 {
 	u8 *arr = tal_arr(ctx, u8, 0);
-	push_tx(tx, push_linearize, &arr, uses_witness(tx));
+	push_tx(tx, push_linearize, &arr, true);
 	return arr;
 }
 
-static void push_measure(const void *data, size_t len, void *lenp)
+static void push_measure(const void *data UNUSED, size_t len, void *lenp)
 {
 	*(size_t *)lenp += len;
 }
 
-size_t measure_tx_cost(const struct bitcoin_tx *tx)
+size_t measure_tx_weight(const struct bitcoin_tx *tx)
 {
 	size_t non_witness_len = 0, witness_len = 0;
 	push_tx(tx, push_measure, &non_witness_len, false);
-	if (uses_witness(tx))
+	if (uses_witness(tx)) {
 		push_witnesses(tx, push_measure, &witness_len);
+		/* Include BIP 144 marker and flag bytes in witness length */
+		witness_len += 2;
+	}
 
-	/* Witness bytes only push 1/4 of normal bytes, for cost. */
+	/* Normal bytes weigh 4 times more than Witness bytes */
 	return non_witness_len * 4 + witness_len;
 }
 
@@ -319,12 +317,12 @@ static u64 pull_value(const u8 **cursor, size_t *max)
 	return amount;
 }
 
-/* Pulls a varint which specifies a data length: ensures basic sanity to
- * avoid trivial OOM */
-static u64 pull_length(const u8 **cursor, size_t *max)
+/* Pulls a varint which specifies n items of mult size: ensures basic
+ * sanity to avoid trivial OOM */
+static u64 pull_length(const u8 **cursor, size_t *max, size_t mult)
 {
 	u64 v = pull_varint(cursor, max);
-	if (v > *max) {
+	if (v * mult > *max) {
 		*cursor = NULL;
 		*max = 0;
 		return 0;
@@ -338,7 +336,7 @@ static void pull_input(const tal_t *ctx, const u8 **cursor, size_t *max,
 	u64 script_len;
 	pull_sha256_double(cursor, max, &input->txid.shad);
 	input->index = pull_le32(cursor, max);
-	script_len = pull_length(cursor, max);
+	script_len = pull_length(cursor, max, 1);
 	if (script_len)
 		input->script = tal_arr(ctx, u8, script_len);
 	else
@@ -351,13 +349,13 @@ static void pull_output(const tal_t *ctx, const u8 **cursor, size_t *max,
 			struct bitcoin_tx_output *output)
 {
 	output->amount = pull_value(cursor, max);
-	output->script = tal_arr(ctx, u8, pull_length(cursor, max));
+	output->script = tal_arr(ctx, u8, pull_length(cursor, max, 1));
 	pull(cursor, max, output->script, tal_len(output->script));
 }
 
 static u8 *pull_witness_item(const tal_t *ctx, const u8 **cursor, size_t *max)
 {
-	uint64_t len = pull_length(cursor, max);
+	uint64_t len = pull_length(cursor, max, 1);
 	u8 *item;
 
 	item = tal_arr(ctx, u8, len);
@@ -368,7 +366,7 @@ static u8 *pull_witness_item(const tal_t *ctx, const u8 **cursor, size_t *max)
 static void pull_witness(struct bitcoin_tx_input *inputs, size_t i,
 			 const u8 **cursor, size_t *max)
 {
-	uint64_t j, num = pull_length(cursor, max);
+	uint64_t j, num = pull_length(cursor, max, 1);
 
 	/* 0 means not using witness. */
 	if (num == 0) {
@@ -383,29 +381,29 @@ static void pull_witness(struct bitcoin_tx_input *inputs, size_t i,
 	}
 }
 
-struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx,
-				   const u8 **cursor, size_t *max)
+struct bitcoin_tx *pull_bitcoin_tx(const tal_t *ctx, const u8 **cursor,
+				   size_t *max)
 {
-	struct bitcoin_tx *tx = tal(ctx, struct bitcoin_tx);
 	size_t i;
 	u64 count;
 	u8 flag = 0;
+	struct bitcoin_tx *tx = tal(ctx, struct bitcoin_tx);
 
 	tx->version = pull_le32(cursor, max);
-	count = pull_length(cursor, max);
+	count = pull_length(cursor, max, 32 + 4 + 4 + 1);
 	/* BIP 144 marker is 0 (impossible to have tx with 0 inputs) */
 	if (count == 0) {
 		pull(cursor, max, &flag, 1);
 		if (flag != SEGREGATED_WITNESS_FLAG)
 			return tal_free(tx);
-		count = pull_length(cursor, max);
+		count = pull_length(cursor, max, 32 + 4 + 4 + 1);
 	}
 
 	tx->input = tal_arr(tx, struct bitcoin_tx_input, count);
 	for (i = 0; i < tal_count(tx->input); i++)
 		pull_input(tx, cursor, max, tx->input + i);
 
-	count = pull_length(cursor, max);
+	count = pull_length(cursor, max, 8 + 1);
 	tx->output = tal_arr(tx, struct bitcoin_tx_output, count);
 	for (i = 0; i < tal_count(tx->output); i++)
 		pull_output(tx, cursor, max, tx->output + i);

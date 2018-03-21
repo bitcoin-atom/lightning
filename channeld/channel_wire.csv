@@ -55,9 +55,10 @@ channel_init,,local_funding_locked,bool
 channel_init,,remote_funding_locked,bool
 channel_init,,funding_short_id,struct short_channel_id
 channel_init,,reestablish,bool
-channel_init,,shutdown_scriptpubkey_len,u16
-channel_init,,shutdown_scriptpubkey,shutdown_scriptpubkey_len*u8
+channel_init,,send_shutdown,bool
 channel_init,,remote_shutdown_received,bool
+channel_init,,final_scriptpubkey_len,u16
+channel_init,,final_scriptpubkey,final_scriptpubkey_len*u8
 channel_init,,flags,u8
 channel_init,,init_peer_pkt_len,u16
 channel_init,,init_peer_pkt,init_peer_pkt_len*u8
@@ -84,7 +85,7 @@ channel_offer_htlc_reply,,failure_code,u16
 channel_offer_htlc_reply,,failurestrlen,u16
 channel_offer_htlc_reply,,failurestr,failurestrlen*u8
 
-# Main daemon found out the preimage for an htlc
+# Main daemon found out the preimage for an HTLC
 #include <bitcoin/preimage.h>
 channel_fulfill_htlc,1005
 channel_fulfill_htlc,,id,u64
@@ -96,7 +97,7 @@ channel_fail_htlc,,id,u64
 # If this is non-zero length, you need to wrap this and pass it on.
 channel_fail_htlc,,len,u16
 channel_fail_htlc,,error_pkt,len*u8
-# If it errcode is != 0, it's a local error, otherwise we're passing thru.
+# If it errcode is != 0, it's a local error, otherwise we're passing through.
 channel_fail_htlc,,errcode,u16
 # If errcode & UPDATE, this says which outgoing channel failed.
 channel_fail_htlc,,which_channel,struct short_channel_id
@@ -164,10 +165,8 @@ channel_got_revoke,,changed,num_changed*struct changed_htlc
 # (eg. if we sent another commitment_signed, that would implicitly ack).
 channel_got_revoke_reply,1122
 
-# Tell peer that channel is shutting down
+# Tell peer to shut down channel.
 channel_send_shutdown,1023
-channel_send_shutdown,,scriptpubkey_len,u16
-channel_send_shutdown,,scriptpubkey,scriptpubkey_len*u8
 
 # Peer told us that channel is shutting down
 channel_got_shutdown,1024

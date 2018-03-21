@@ -1,6 +1,9 @@
 #! /usr/bin/make
 NAME=Bitcoin Savings & Trust Daily Interest II
 
+# TODO: Decide: c-lightning, lightningd, lightning?
+PKGNAME = c-lightning
+
 # We use our own internal ccan copy.
 CCANDIR := ccan
 
@@ -29,7 +32,21 @@ ifeq ($(COVERAGE),1)
 COVFLAGS = --coverage
 endif
 
+ifeq ($(PIE),1)
+PIE_CFLAGS=-fPIE -fPIC
+PIE_LDFLAGS=-pie
+endif
+
+ifneq ($(NO_COMPAT),1)
+# We support compatibility with pre-0.6.
+COMPAT_CFLAGS=-DCOMPAT_V052=1
+endif
+
 PYTEST := $(shell command -v pytest 2> /dev/null)
+PYTEST_OPTS := -v -x
+ifeq ($(TRAVIS),true)
+PYTEST_OPTS += --reruns=3
+endif
 
 # This is where we add new features as bitcoin adds them.
 FEATURES :=
@@ -44,6 +61,7 @@ CCAN_OBJS :=					\
 	ccan-crypto-sha256.o			\
 	ccan-crypto-shachain.o			\
 	ccan-crypto-siphash24.o			\
+	ccan-daemonize.o			\
 	ccan-err.o				\
 	ccan-fdpass.o				\
 	ccan-htable.o				\
@@ -62,11 +80,13 @@ CCAN_OBJS :=					\
 	ccan-opt-usage.o			\
 	ccan-opt.o				\
 	ccan-pipecmd.o				\
+	ccan-ptr_valid.o			\
 	ccan-read_write_all.o			\
 	ccan-str-hex.o				\
 	ccan-str.o				\
 	ccan-take.o				\
 	ccan-tal-grab_file.o			\
+	ccan-tal-link.o				\
 	ccan-tal-path.o				\
 	ccan-tal-str.o				\
 	ccan-tal.o				\
@@ -93,6 +113,7 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/crypto/sha256/sha256.h		\
 	$(CCANDIR)/ccan/crypto/shachain/shachain.h	\
 	$(CCANDIR)/ccan/crypto/siphash24/siphash24.h	\
+	$(CCANDIR)/ccan/daemonize/daemonize.h		\
 	$(CCANDIR)/ccan/endian/endian.h			\
 	$(CCANDIR)/ccan/err/err.h			\
 	$(CCANDIR)/ccan/fdpass/fdpass.h			\
@@ -125,6 +146,7 @@ CCAN_HEADERS :=						\
 	$(CCANDIR)/ccan/structeq/structeq.h		\
 	$(CCANDIR)/ccan/take/take.h			\
 	$(CCANDIR)/ccan/tal/grab_file/grab_file.h	\
+	$(CCANDIR)/ccan/tal/link/link.h			\
 	$(CCANDIR)/ccan/tal/path/path.h			\
 	$(CCANDIR)/ccan/tal/str/str.h			\
 	$(CCANDIR)/ccan/tal/tal.h			\
@@ -141,11 +163,16 @@ WIRE_GEN := tools/generate-wire.py
 
 ALL_PROGRAMS =
 
+CPPFLAGS = -DBINTOPKGLIBEXECDIR='"'$(shell sh tools/rel.sh $(bindir) $(pkglibexecdir))'"'
 CWARNFLAGS := -Werror -Wall -Wundef -Wmissing-prototypes -Wmissing-declarations -Wstrict-prototypes -Wold-style-definition
 CDEBUGFLAGS := -std=gnu11 -g -fstack-protector
-CFLAGS = $(CWARNFLAGS) $(CDEBUGFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48
+CFLAGS = $(CPPFLAGS) $(CWARNFLAGS) $(CDEBUGFLAGS) -I $(CCANDIR) $(EXTERNAL_INCLUDE_FLAGS) -I . -I/usr/local/include $(FEATURES) $(COVFLAGS) $(DEV_CFLAGS) -DSHACHAIN_BITS=48 -DJSMN_PARENT_LINKS $(PIE_CFLAGS) $(COMPAT_CFLAGS)
 
-LDLIBS = -lgmp -lsqlite3 $(COVFLAGS)
+# We can get configurator to run a different compile cmd to cross-configure.
+CONFIGURATOR_CC := $(CC)
+
+LDFLAGS = $(PIE_LDFLAGS)
+LDLIBS = -L/usr/local/lib -lm -lgmp -lsqlite3 $(COVFLAGS)
 
 default: all-programs all-test-programs
 
@@ -162,7 +189,6 @@ include closingd/Makefile
 include onchaind/Makefile
 include lightningd/Makefile
 include cli/Makefile
-include test/Makefile
 include doc/Makefile
 include devtools/Makefile
 
@@ -175,13 +201,14 @@ TEST_GROUP_COUNT=1
 endif
 
 check:
+	$(MAKE) installcheck
 	$(MAKE) pytest
 
 pytest: $(ALL_PROGRAMS)
 ifndef PYTEST
-	PYTHONPATH=contrib/pylightning DEVELOPER=$(DEVELOPER) python3 tests/test_lightningd.py -f
+	PYTHONPATH=contrib/pylightning:$$PYTHONPATH DEVELOPER=$(DEVELOPER) python3 tests/test_lightningd.py -f
 else
-	PYTHONPATH=contrib/pylightning TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) $(PYTEST) -vx tests/test_lightningd.py --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT)
+	PYTHONPATH=contrib/pylightning:$$PYTHONPATH TEST_DEBUG=1 DEVELOPER=$(DEVELOPER) $(PYTEST) -vx tests/test_lightningd.py --test-group=$(TEST_GROUP) --test-group-count=$(TEST_GROUP_COUNT) $(PYTEST_OPTS)
 endif
 
 # Keep includes in alpha order.
@@ -215,7 +242,18 @@ check-whitespace/%: %
 
 check-whitespace: check-whitespace/Makefile check-whitespace/tools/check-bolt.c $(ALL_TEST_PROGRAMS:%=check-whitespace/%.c)
 
-check-source: check-makefile check-source-bolt check-whitespace
+check-markdown:
+	@tools/check-markdown.sh
+
+check-spelling:
+	@tools/check-spelling.sh
+
+check-python:
+	@# E501 line too long (N > 79 characters)
+	@# E731 do not assign a lambda expression, use a def
+	@git ls-files "*.py" | xargs flake8 --ignore=E501,E731 --exclude=contrib/pylightning/lightning/__init__.py
+
+check-source: check-makefile check-source-bolt check-whitespace check-markdown check-spelling check-python
 
 full-check: check check-source
 
@@ -235,10 +273,10 @@ ccan/ccan/cdump/tools/cdump-enumstr: ccan/ccan/cdump/tools/cdump-enumstr.o $(CDU
 
 ALL_PROGRAMS += ccan/ccan/cdump/tools/cdump-enumstr
 # Can't add to ALL_OBJS, as that makes a circular dep.
-ccan/ccan/cdump/tools/cdump-enumstr.o: $(CCAN_HEADERS)
+ccan/ccan/cdump/tools/cdump-enumstr.o: $(CCAN_HEADERS) Makefile
 
-ccan/config.h: ccan/tools/configurator/configurator
-	if $< > $@.new; then mv $@.new $@; else rm $@.new; exit 1; fi
+ccan/config.h: ccan/tools/configurator/configurator Makefile
+	if $< --configurator-cc="$(CONFIGURATOR_CC)" $(CC) $(CFLAGS) > $@.new; then mv $@.new $@; else rm $@.new; exit 1; fi
 
 gen_version.h: FORCE
 	@(echo "#define VERSION \"`git describe --always --dirty`\"" && echo "#define VERSION_NAME \"$(NAME)\"" && echo "#define BUILD_FEATURES \"$(FEATURES)\"") > $@.new
@@ -257,14 +295,14 @@ $(ALL_TEST_PROGRAMS): %: %.o
 $(ALL_PROGRAMS) $(ALL_TEST_PROGRAMS):
 	$(LINK.o) $(filter-out %.a,$^) $(LOADLIBES) $(EXTERNAL_LDLIBS) $(LDLIBS) -o $@
 
-# Everything depends on the CCAN headers.
-$(CCAN_OBJS) $(CDUMP_OBJS): $(CCAN_HEADERS)
+# Everything depends on the CCAN headers, and Makefile
+$(CCAN_OBJS) $(CDUMP_OBJS): $(CCAN_HEADERS) Makefile
 
-# Except for CCAN, we treat everything else as dependent on external/ bitcoin/ common/ wire/ and all generated headers.
-$(ALL_OBJS): $(BITCOIN_HEADERS) $(COMMON_HEADERS) $(CCAN_HEADERS) $(WIRE_HEADERS) $(ALL_GEN_HEADERS) $(EXTERNAL_HEADERS)
+# Except for CCAN, we treat everything else as dependent on external/ bitcoin/ common/ wire/ and all generated headers, and Makefile
+$(ALL_OBJS): $(BITCOIN_HEADERS) $(COMMON_HEADERS) $(CCAN_HEADERS) $(WIRE_HEADERS) $(ALL_GEN_HEADERS) $(EXTERNAL_HEADERS) Makefile
 
-# We generate headers in two ways, so regen when either changes.
-$(ALL_GEN_HEADERS): ccan/ccan/cdump/tools/cdump-enumstr $(WIRE_GEN)
+# We generate headers in two ways, so regen when either changes (or Makefile)
+$(ALL_GEN_HEADERS): ccan/ccan/cdump/tools/cdump-enumstr $(WIRE_GEN) Makefile
 
 update-ccan:
 	mv ccan ccan.old
@@ -302,11 +340,116 @@ update-mocks/%: %
 unittest/%: %
 	$(VALGRIND) $(VALGRIND_TEST_ARGS) $*
 
+# Installation directories
+prefix = /usr/local
+exec_prefix = $(prefix)
+bindir = $(exec_prefix)/bin
+libexecdir = $(exec_prefix)/libexec
+pkglibexecdir = $(libexecdir)/$(PKGNAME)
+datadir = $(prefix)/share
+docdir = $(datadir)/doc/$(PKGNAME)
+mandir = $(datadir)/man
+man1dir = $(mandir)/man1
+man7dir = $(mandir)/man7
+
+# Commands
+MKDIR_P = mkdir -p
+INSTALL = install
+INSTALL_PROGRAM = $(INSTALL)
+INSTALL_DATA = $(INSTALL) -m 644
+
+# Tags needed by some package systems.
+PRE_INSTALL = :
+NORMAL_INSTALL = :
+POST_INSTALL = :
+PRE_UNINSTALL = :
+NORMAL_UNINSTALL = :
+POST_UNINSTALL = :
+
+# Target to create directories.
+installdirs:
+	@$(NORMAL_INSTALL)
+	$(MKDIR_P) $(DESTDIR)$(bindir)
+	$(MKDIR_P) $(DESTDIR)$(pkglibexecdir)
+	$(MKDIR_P) $(DESTDIR)$(man1dir)
+	$(MKDIR_P) $(DESTDIR)$(man7dir)
+	$(MKDIR_P) $(DESTDIR)$(docdir)
+
+# Programs to install in bindir and pkglibexecdir.
+# TODO: $(EXEEXT) support for Windows?  Needs more coding for
+# the individual Makefiles, however.
+BIN_PROGRAMS = \
+	       cli/lightning-cli \
+	       lightningd/lightningd
+PKGLIBEXEC_PROGRAMS = \
+	       lightningd/lightning_channeld \
+	       lightningd/lightning_closingd \
+	       lightningd/lightning_gossipd \
+	       lightningd/lightning_hsmd \
+	       lightningd/lightning_onchaind \
+	       lightningd/lightning_openingd
+
+install-program: installdirs $(BIN_PROGRAMS) $(PKGLIBEXEC_PROGRAMS)
+	@$(NORMAL_INSTALL)
+	$(INSTALL_PROGRAM) $(BIN_PROGRAMS) $(DESTDIR)$(bindir)
+	$(INSTALL_PROGRAM) $(PKGLIBEXEC_PROGRAMS) $(DESTDIR)$(pkglibexecdir)
+
+MAN1PAGES = $(filter %.1,$(MANPAGES))
+MAN7PAGES = $(filter %.7,$(MANPAGES))
+DOC_DATA = README.md doc/INSTALL.md doc/HACKING.md LICENSE
+
+install-data: installdirs $(MAN1PAGES) $(MAN7PAGES) $(DOC_DATA)
+	@$(NORMAL_INSTALL)
+	$(INSTALL_DATA) $(MAN1PAGES) $(DESTDIR)$(man1dir)
+	$(INSTALL_DATA) $(MAN7PAGES) $(DESTDIR)$(man7dir)
+	$(INSTALL_DATA) $(DOC_DATA) $(DESTDIR)$(docdir)
+
+install: install-program install-data
+
+uninstall:
+	@$(NORMAL_UNINSTALL)
+	@for f in $(BIN_PROGRAMS); do \
+	  echo rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
+	  rm -f $(DESTDIR)$(bindir)/`basename $$f`; \
+	done
+	@for f in $(PKGLIBEXEC_PROGRAMS); do \
+	  echo rm -f $(DESTDIR)$(pkglibexecdir)/`basename $$f`; \
+	  rm -f $(DESTDIR)$(pkglibexecdir)/`basename $$f`; \
+	done
+	@for f in $(MAN1PAGES); do \
+	  echo rm -f $(DESTDIR)$(man1dir)/`basename $$f`; \
+	  rm -f $(DESTDIR)$(man1dir)/`basename $$f`; \
+	done
+	@for f in $(MAN7PAGES); do \
+	  echo rm -f $(DESTDIR)$(man7dir)/`basename $$f`; \
+	  rm -f $(DESTDIR)$(man7dir)/`basename $$f`; \
+	done
+	@for f in $(DOC_DATA); do \
+	  echo rm -f $(DESTDIR)$(docdir)/`basename $$f`; \
+	  rm -f $(DESTDIR)$(docdir)/`basename $$f`; \
+	done
+
+installcheck:
+	@rm -rf testinstall || true
+	$(MAKE) DESTDIR=$$(pwd)/testinstall install
+	testinstall$(bindir)/lightningd --test-daemons-only --lightning-dir=testinstall
+	$(MAKE) DESTDIR=$$(pwd)/testinstall uninstall
+	@if test `find testinstall '!' -type d | wc -l` -ne 0; then \
+		echo 'make uninstall left some files in testinstall directory!'; \
+		exit 1; \
+	fi
+	@rm -rf testinstall || true
+
+.PHONY: installdirs install-program install-data install uninstall \
+	installcheck
+
 ccan-breakpoint.o: $(CCANDIR)/ccan/breakpoint/breakpoint.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-tal.o: $(CCANDIR)/ccan/tal/tal.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-tal-str.o: $(CCANDIR)/ccan/tal/str/str.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-tal-link.o: $(CCANDIR)/ccan/tal/link/link.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-tal-path.o: $(CCANDIR)/ccan/tal/path/path.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -320,6 +463,8 @@ ccan-asort.o: $(CCANDIR)/ccan/asort/asort.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-autodata.o: $(CCANDIR)/ccan/autodata/autodata.c
 	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-ptr_valid.o: $(CCANDIR)/ccan/ptr_valid/ptr_valid.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-read_write_all.o: $(CCANDIR)/ccan/read_write_all/read_write_all.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-str.o: $(CCANDIR)/ccan/str/str.c
@@ -331,6 +476,8 @@ ccan-opt-helpers.o: $(CCANDIR)/ccan/opt/helpers.c
 ccan-opt-parse.o: $(CCANDIR)/ccan/opt/parse.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-opt-usage.o: $(CCANDIR)/ccan/opt/usage.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+ccan-daemonize.o: $(CCANDIR)/ccan/daemonize/daemonize.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 ccan-err.o: $(CCANDIR)/ccan/err/err.c
 	$(CC) $(CFLAGS) -c -o $@ $<

@@ -2,6 +2,7 @@
 #define LIGHTNING_LIGHTNINGD_BITCOIND_H
 #include "config.h"
 #include <bitcoin/chainparams.h>
+#include <bitcoin/tx.h>
 #include <ccan/list/list.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
@@ -10,10 +11,11 @@
 #include <stdbool.h>
 
 struct bitcoin_blkid;
+struct bitcoin_tx_output;
+struct block;
 struct lightningd;
 struct ripemd160;
 struct bitcoin_tx;
-struct peer;
 struct bitcoin_block;
 
 enum bitcoind_mode {
@@ -23,6 +25,9 @@ enum bitcoind_mode {
 };
 
 struct bitcoind {
+	/* eg. "bitcoin-cli" */
+	char *cli;
+
 	/* -datadir arg for bitcoin-cli. */
 	char *datadir;
 
@@ -47,6 +52,9 @@ struct bitcoind {
 
 	/* Ignore results, we're shutting down. */
 	bool shutdown;
+
+	/* Passthrough parameters for bitcoin-cli */
+	char *rpcuser, *rpcpass, *rpcconnect;
 };
 
 struct bitcoind *new_bitcoind(const tal_t *ctx,
@@ -127,4 +135,27 @@ void bitcoind_getrawblock_(struct bitcoind *bitcoind,
 						  struct bitcoind *,	\
 						  struct bitcoin_block *), \
 			      (arg))
+
+void bitcoind_getoutput_(struct bitcoind *bitcoind,
+			 unsigned int blocknum, unsigned int txnum,
+			 unsigned int outnum,
+			 void (*cb)(struct bitcoind *bitcoind,
+				    const struct bitcoin_tx_output *output,
+				    void *arg),
+			 void *arg);
+#define bitcoind_getoutput(bitcoind_, blocknum, txnum, outnum, cb, arg)	\
+	bitcoind_getoutput_((bitcoind_), (blocknum), (txnum), (outnum),	\
+			    typesafe_cb_preargs(void, void *,		\
+						(cb), (arg),		\
+						struct bitcoind *,	\
+						const struct bitcoin_tx_output*), \
+			    (arg))
+
+void bitcoind_gettxout(struct bitcoind *bitcoind,
+		       const struct bitcoin_txid *txid, const u32 outnum,
+		       void (*cb)(struct bitcoind *bitcoind,
+				  const struct bitcoin_tx_output *txout,
+				  void *arg),
+		       void *arg);
+
 #endif /* LIGHTNING_LIGHTNINGD_BITCOIND_H */

@@ -40,9 +40,8 @@ onchain_htlc,,htlc,struct htlc_stub
 onchain_htlc,,tell_if_missing,bool
 onchain_htlc,,tell_immediately,bool
 
-# This sets what the state is, depending on tx.
+# This says we're ready; give us preimages.
 onchain_init_reply,5101
-onchain_init_reply,,state,u8
 
 # onchaind->master: Send out a tx.
 onchain_broadcast_tx,5003
@@ -62,7 +61,6 @@ onchain_depth,,depth,u32
 # onchaind->master: We don't want to watch this tx, or its outputs
 onchain_unwatch_tx,5006
 onchain_unwatch_tx,,txid,struct bitcoin_txid
-onchain_unwatch_tx,,num_outputs,u32
 
 # master->onchaind: We know HTLC preimage
 onchain_known_preimage,5007
@@ -82,3 +80,10 @@ onchain_htlc_timeout,,htlc,struct htlc_stub
 
 # onchaind->master: this peer can be forgotten
 onchain_all_irrevocably_resolved,5011
+
+# onchaind->master: hey, I identified an UTXO you'll want to track
+onchain_add_utxo,5012
+onchain_add_utxo,,prev_out_tx,struct bitcoin_txid
+onchain_add_utxo,,prev_out_index,u32
+onchain_add_utxo,,per_commit_point,struct pubkey
+onchain_add_utxo,,value,u64

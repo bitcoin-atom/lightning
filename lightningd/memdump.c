@@ -62,17 +62,20 @@ static void json_memdump(struct command *cmd,
 static const struct json_command dev_memdump_command = {
 	"dev-memdump",
 	json_memdump,
-	"Dump the memory objects currently used",
-	"Debugging tool for memory leaks"
+	"Show memory objects currently in use"
 };
 AUTODATA(json_command, &dev_memdump_command);
 
-static int json_add_syminfo(void *data, uintptr_t pc,
+static int json_add_syminfo(void *data, uintptr_t pc UNUSED,
 			    const char *filename, int lineno,
 			    const char *function)
 {
 	struct json_result *response = data;
 	char *str;
+
+	/* This can happen in backtraces. */
+	if (!filename || !function)
+		return 0;
 
 	str = tal_fmt(response, "%s:%u (%s)", filename, lineno, function);
 	json_add_string(response, NULL, str);
@@ -144,9 +147,11 @@ static void json_memleak(struct command *cmd,
 {
 	struct json_result *response = new_json_result(cmd);
 
-	if (!getenv("LIGHTNINGD_DEV_MEMLEAK"))
+	if (!getenv("LIGHTNINGD_DEV_MEMLEAK")) {
 		command_fail(cmd,
 			     "Leak detection needs $LIGHTNINGD_DEV_MEMLEAK");
+		return;
+	}
 
 	json_object_start(response, NULL);
 	scan_mem(cmd, response, cmd->ld);
@@ -158,8 +163,7 @@ static void json_memleak(struct command *cmd,
 static const struct json_command dev_memleak_command = {
 	"dev-memleak",
 	json_memleak,
-	"Dump the memory objects unreferenced",
-	"Debugging tool for memory leaks"
+	"Show unreferenced memory objects"
 };
 AUTODATA(json_command, &dev_memleak_command);
 #endif /* DEVELOPER */

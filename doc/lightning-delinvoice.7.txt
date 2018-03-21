@@ -4,21 +4,23 @@ LIGHTNING-DELINVOICE(7)
 
 NAME
 ----
-lightning-delinvoice - Protocol for removing an unpaid invoice.
+lightning-delinvoice - Protocol for removing an invoice.
 
 SYNOPSIS
 --------
-*delinvoice* 'label'
+*delinvoice* 'label' 'status'
 
 DESCRIPTION
 -----------
-The *delinvoice* RPC command removes an unpaid invoice.  The caller
-should be particularly aware of the error case caused by a payment
-just before this command is invoked!
+The *delinvoice* RPC command removes an invoice with 'status' as
+given in *listinvoices*.
+
+The caller should be particularly aware of the error case caused by 
+the 'status' changing just before this command is invoked!
 
 RETURN VALUE
 ------------
-On success, the 'rhash', 'label' and 'msatoshi' will be returned.
+On success, an invoice description will be returned as per lightning-listinvoice(7).
 
 //FIXME:Enumerate errors
 
@@ -28,7 +30,8 @@ Rusty Russell <rusty@rustcorp.com.au> is mainly responsible.
 
 SEE ALSO
 --------
-lightning-listinvoice(7), lightning-waitinvoice(7), lightning-invoice(7).
+lightning-listinvoice(7), lightning-waitinvoice(7), lightning-invoice(7),
+lightning-delexpiredinvoice(7), lightning-autocleaninvoice(7)
 
 RESOURCES
 ---------

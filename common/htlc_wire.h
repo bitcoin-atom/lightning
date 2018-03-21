@@ -42,19 +42,17 @@ void towire_changed_htlc(u8 **pptr, const struct changed_htlc *changed);
 void towire_htlc_state(u8 **pptr, const enum htlc_state hstate);
 void towire_side(u8 **pptr, const enum side side);
 void towire_shachain(u8 **pptr, const struct shachain *shachain);
-void towire_bitcoin_tx(u8 **pptr, const struct bitcoin_tx *tx);
 
 void fromwire_added_htlc(const u8 **cursor, size_t *max,
 			 struct added_htlc *added);
 void fromwire_fulfilled_htlc(const u8 **cursor, size_t *max,
 			     struct fulfilled_htlc *fulfilled);
-void fromwire_failed_htlc(const tal_t *ctx, const u8 **cursor, size_t *max,
-			  struct failed_htlc *failed);
+struct failed_htlc *fromwire_failed_htlc(const tal_t *ctx, const u8 **cursor,
+					 size_t *max);
 void fromwire_changed_htlc(const u8 **cursor, size_t *max,
 			   struct changed_htlc *changed);
 enum htlc_state fromwire_htlc_state(const u8 **cursor, size_t *max);
 enum side fromwire_side(const u8 **cursor, size_t *max);
 void fromwire_shachain(const u8 **cursor, size_t *max,
 		       struct shachain *shachain);
-void fromwire_bitcoin_tx(const u8 **cursor, size_t *max, struct bitcoin_tx *tx);
 #endif /* LIGHTNING_COMMON_HTLC_WIRE_H */

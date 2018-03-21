@@ -24,7 +24,6 @@ u8 *towire_errorfmtv(const tal_t *ctx,
 	msg = towire_error(ctx, channel ? channel : &all_channels,
 			   (u8 *)tal_dup_arr(estr, char, estr, strlen(estr), 0));
 	tal_free(estr);
-	va_end(ap);
 
 	return msg;
 }
@@ -58,7 +57,7 @@ char *sanitize_error(const tal_t *ctx, const u8 *errmsg,
 	if (!channel_id)
 		channel_id = &dummy;
 
-	if (!fromwire_error(ctx, errmsg, NULL, channel_id, &data))
+	if (!fromwire_error(ctx, errmsg, channel_id, &data))
 		return tal_fmt(ctx, "Invalid ERROR message '%s'",
 			       tal_hex(ctx, errmsg));
 

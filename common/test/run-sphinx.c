@@ -4,7 +4,6 @@
 #include <ccan/short_types/short_types.h>
 #include <string.h>
 #include <ccan/str/hex/hex.h>
-#include <ccan/read_write_all/read_write_all.h>
 #include <common/sphinx.h>
 #include <common/utils.h>
 #include <err.h>
@@ -73,7 +72,6 @@ static struct secret secret_from_hex(const char *hex)
  * we match the test vectors and that we can also unwrap it. */
 static void run_unit_tests(void)
 {
-	tal_t *tmpctx = tal_tmpctx(NULL);
 	struct onionreply *oreply;
 	u8 *reply;
 	u8 *raw = tal_hexdata(tmpctx, "2002", 4);
@@ -156,19 +154,17 @@ static void run_unit_tests(void)
 	oreply = unwrap_onionreply(tmpctx, ss, 5, reply);
 	printf("unwrapped %s\n", tal_hex(tmpctx, oreply->msg));
 	assert(memcmp(raw, oreply->msg, tal_len(raw)) == 0);
-
-	tal_free(tmpctx);
 }
 
 int main(int argc, char **argv)
 {
 	bool generate = false, decode = false, unit = false;
-	const tal_t *ctx = talz(NULL, tal_t);
 	u8 assocdata[32];
 	memset(assocdata, 'B', sizeof(assocdata));
 
 	secp256k1_ctx = secp256k1_context_create(
 		SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
+	setup_tmpctx();
 
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "--generate <pubkey1> <pubkey2>... OR\n"
@@ -190,86 +186,11 @@ int main(int argc, char **argv)
 	if (unit) {
 		run_unit_tests();
 	} else if (generate) {
-		int num_hops = argc - 1;
-		struct pubkey *path = tal_arr(ctx, struct pubkey, num_hops);
-		u8 privkeys[argc - 1][32];
-		u8 sessionkey[32];
-		struct hop_data hops_data[num_hops];
-		struct secret *shared_secrets;
-
-		memset(&sessionkey, 'A', sizeof(sessionkey));
-
-		int i;
-		for (i = 0; i < num_hops; i++) {
-			hex_decode(argv[1 + i], 66, privkeys[i], 33);
-			if (secp256k1_ec_pubkey_create(secp256k1_ctx, &path[i].pubkey, privkeys[i]) != 1)
-				return 1;
-		}
-
-		for (i = 0; i < num_hops; i++) {
-			hops_data[i].realm = 0x00;
-			memset(&hops_data[i].channel_id, i,
-			       sizeof(hops_data[i].channel_id));
-			hops_data[i].amt_forward = i;
-			hops_data[i].outgoing_cltv = i;
-		}
-
-		struct onionpacket *res = create_onionpacket(ctx,
-							     path,
-							     hops_data,
-							     sessionkey,
-							     assocdata,
-							     sizeof(assocdata),
-							     &shared_secrets);
-
-		u8 *serialized = serialize_onionpacket(ctx, res);
-		if (!serialized)
-			errx(1, "Error serializing message.");
-
-		char hextemp[2 * tal_count(serialized) + 1];
-		hex_encode(serialized, tal_count(serialized), hextemp, sizeof(hextemp));
-		printf("%s\n", hextemp);
 
 	} else if (decode) {
-		struct route_step *step;
-		struct onionpacket *msg;
-		struct privkey seckey;
-		const tal_t *ctx = talz(NULL, tal_t);
-		u8 serialized[TOTAL_PACKET_SIZE];
-		char hextemp[2 * sizeof(serialized) + 1];
-		memset(hextemp, 0, sizeof(hextemp));
-		u8 shared_secret[32];
-
-		if (argc != 2)
-			opt_usage_exit_fail("Expect a privkey with --decode");
-		if (!hex_decode(argv[1], strlen(argv[1]), &seckey, sizeof(seckey)))
-			errx(1, "Invalid private key hex '%s'", argv[1]);
-		if (!read_all(STDIN_FILENO, hextemp, sizeof(hextemp)))
-			errx(1, "Reading in onion");
-		hex_decode(hextemp, sizeof(hextemp), serialized, sizeof(serialized));
-
-		msg = parse_onionpacket(ctx, serialized, sizeof(serialized));
-		if (!msg)
-			errx(1, "Error parsing message.");
-
-		if (!onion_shared_secret(shared_secret, msg, &seckey))
-			errx(1, "Error creating shared secret.");
-
-		step = process_onionpacket(ctx, msg, shared_secret, assocdata,
-					   sizeof(assocdata));
-
-		if (!step->next)
-			errx(1, "Error processing message.");
-
-		u8 *ser = serialize_onionpacket(ctx, step->next);
-		if (!ser)
-			errx(1, "Error serializing message.");
-
-		hex_encode(ser, tal_count(ser), hextemp, sizeof(hextemp));
-		printf("%s\n", hextemp);
 	}
 	secp256k1_context_destroy(secp256k1_ctx);
 	opt_free_table();
-	tal_free(ctx);
+	tal_free(tmpctx);
 	return 0;
 }

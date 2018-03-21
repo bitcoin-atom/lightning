@@ -3,6 +3,11 @@
 static void db_fatal(const char *fmt, ...);
 #define fatal db_fatal
 
+static void db_log_(struct log *log UNUSED, enum log_level level UNUSED, const char *fmt UNUSED, ...)
+{
+}
+#define log_ db_log_
+
 #include "wallet/db.c"
 
 #include "test_utils.h"
@@ -27,7 +32,7 @@ static void db_fatal(const char *fmt, ...)
 	va_end(ap);
 }
 
-static struct db *create_test_db(const char *testname)
+static struct db *create_test_db(void)
 {
 	struct db *db;
 	char filename[] = "/tmp/ldb-XXXXXX";
@@ -43,12 +48,12 @@ static struct db *create_test_db(const char *testname)
 
 static bool test_empty_db_migrate(void)
 {
-	struct db *db = create_test_db(__func__);
+	struct db *db = create_test_db();
 	CHECK(db);
 	db_begin_transaction(db);
 	CHECK(db_get_version(db) == -1);
 	db_commit_transaction(db);
-	db_migrate(db);
+	db_migrate(db, NULL);
 	db_begin_transaction(db);
 	CHECK(db_get_version(db) == db_migration_count());
 	db_commit_transaction(db);
@@ -59,7 +64,7 @@ static bool test_empty_db_migrate(void)
 
 static bool test_primitives(void)
 {
-	struct db *db = create_test_db(__func__);
+	struct db *db = create_test_db();
 	db_begin_transaction(db);
 	CHECK(db->in_transaction);
 	db_commit_transaction(db);
@@ -83,10 +88,10 @@ static bool test_primitives(void)
 
 static bool test_vars(void)
 {
-	struct db *db = create_test_db(__func__);
+	struct db *db = create_test_db();
 	char *varname = "testvar";
 	CHECK(db);
-	db_migrate(db);
+	db_migrate(db, NULL);
 
 	db_begin_transaction(db);
 	/* Check default behavior */

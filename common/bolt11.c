@@ -235,7 +235,7 @@ static void decode_h(struct bolt11 *b11,
 static char *decode_x(struct bolt11 *b11,
                       struct hash_u5 *hu5,
                       u5 **data, size_t *data_len,
-                      size_t data_length, bool *have_x)
+                      size_t data_length, const bool *have_x)
 {
         if (*have_x)
                 return unknown_field(b11, hu5, data, data_len, 'x',
@@ -257,7 +257,7 @@ static char *decode_x(struct bolt11 *b11,
 static char *decode_c(struct bolt11 *b11,
                       struct hash_u5 *hu5,
                       u5 **data, size_t *data_len,
-                      size_t data_length, bool *have_c)
+                      size_t data_length, const bool *have_c)
 {
         u64 c;
         if (*have_c)
@@ -410,7 +410,6 @@ static char *decode_r(struct bolt11 *b11,
                       u5 **data, size_t *data_len,
                       size_t data_length)
 {
-        tal_t *tmpctx = tal_tmpctx(b11);
         size_t rlen = data_length * 5 / 8;
         u8 *r8 = tal_arr(tmpctx, u8, rlen);
         size_t n = 0;
@@ -423,7 +422,6 @@ static char *decode_r(struct bolt11 *b11,
         do {
                 tal_resize(&r, n+1);
                 if (!fromwire_route_info(&cursor, &rlen, &r[n])) {
-                        tal_free(tmpctx);
                         return tal_fmt(b11, "r: hop %zu truncated", n);
                 }
                 n++;
@@ -434,7 +432,6 @@ static char *decode_r(struct bolt11 *b11,
         tal_resize(&b11->routes, n+1);
         b11->routes[n] = tal_steal(b11, r);
 
-        tal_free(tmpctx);
         return NULL;
 }
 
@@ -464,7 +461,6 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
         u5 *data;
         size_t data_len;
         struct bolt11 *b11 = new_bolt11(ctx, NULL);
-        tal_t *tmpctx = tal_tmpctx(b11);
         u8 sig_and_recid[65];
         secp256k1_ecdsa_recoverable_signature sig;
         struct hash_u5 hu5;
@@ -473,6 +469,9 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
                 have_x = false, have_f = false, have_c = false;
 
         b11->routes = tal_arr(b11, struct route_info *, 0);
+
+        if (strlen(str) < 8)
+                return decode_fail(b11, fail, "Bad bech32 string");
 
         hrp = tal_arr(tmpctx, char, strlen(str) - 6);
         data = tal_arr(tmpctx, u5, strlen(str) - 8);
@@ -698,7 +697,6 @@ struct bolt11 *bolt11_decode(const tal_t *ctx, const char *str,
                         return decode_fail(b11, fail, "invalid signature");
         }
 
-        tal_free(tmpctx);
         return b11;
 }
 
@@ -774,6 +772,23 @@ static void push_varlen_field(u5 **data, char type, u64 val)
         abort();
 }
 
+/* BOLT #11:
+ *
+ * The fallback field is of format:
+ *
+ * 1. `type` (5 bits)
+ * 2. `data_length` (10 bits, big-endian)
+ * 3. `version` (5 bits)
+ * 4. `data` (addr_len * 8 bits)
+ */
+static void push_fallback_addr(u5 **data, u5 version, const void *addr, u16 addr_len)
+{
+        push_varlen_uint(data, bech32_charset_rev[(unsigned char)'f'], 5);
+        push_varlen_uint(data, ((5 + addr_len * CHAR_BIT) + 4) / 5, 10);
+        push_varlen_uint(data, version, 5);
+        push_bits(data, addr, addr_len * CHAR_BIT);
+}
+
 static void encode_p(u5 **data, const struct sha256 *hash)
 {
         push_field(data, 'p', hash, 256);
@@ -820,34 +835,19 @@ static void encode_f(u5 **data, const u8 *fallback)
          * or `18` followed by a script hash.
          */
         if (is_p2pkh(fallback, &pkh)) {
-                u8 v17[1 + sizeof(pkh)];
-                v17[0] = 17;
-                memcpy(v17+1, &pkh, sizeof(pkh));
-                push_field(data, 'f', v17, sizeof(v17) * CHAR_BIT);
+                push_fallback_addr(data, 17, &pkh, sizeof(pkh));
         } else if (is_p2sh(fallback, &sh)) {
-                u8 v18[1 + sizeof(sh)];
-                v18[0] = 18;
-                memcpy(v18+1, &sh, sizeof(sh));
-                push_field(data, 'f', v18, sizeof(v18) * CHAR_BIT);
+                push_fallback_addr(data, 18, &sh, sizeof(sh));
         } else if (is_p2wpkh(fallback, &pkh)) {
-                u8 v0[1 + sizeof(pkh)];
-                v0[0] = 0;
-                memcpy(v0+1, &pkh, sizeof(pkh));
-                push_field(data, 'f', v0, sizeof(v0) * CHAR_BIT);
+                push_fallback_addr(data, 0, &pkh, sizeof(pkh));
         } else if (is_p2wsh(fallback, &wsh)) {
-                u8 v0[1 + sizeof(wsh)];
-                v0[0] = 0;
-                memcpy(v0+1, &wsh, sizeof(wsh));
-                push_field(data, 'f', v0, sizeof(v0) * CHAR_BIT);
+                push_fallback_addr(data, 0, &wsh, sizeof(wsh));
         } else if (tal_len(fallback)
                    && fallback[0] >= 0x50
                    && fallback[0] < (0x50+16)) {
                 /* Other (future) witness versions: turn OP_N into N */
-                u8 *f = tal_dup_arr(NULL, u8,
-                                    fallback, tal_len(fallback), 0);
-                f[0] -= 0x50;
-                push_field(data, 'f', f, tal_len(f) * CHAR_BIT);
-                tal_free(f);
+                push_fallback_addr(data, fallback[0] - 0x50, fallback + 1,
+                                   tal_len(fallback) - 1);
         } else {
                 /* Copy raw. */
                 push_field(data, 'f',
@@ -888,7 +888,6 @@ char *bolt11_encode_(const tal_t *ctx,
                                   void *arg),
 		     void *arg)
 {
-        tal_t *tmpctx = tal_tmpctx(ctx);
         u5 *data = tal_arr(tmpctx, u5, 0);
         char *hrp, *output;
         char postfix;
@@ -966,12 +965,12 @@ char *bolt11_encode_(const tal_t *ctx,
 
         /* FIXME: towire_ should check this? */
         if (tal_len(data) > 65535)
-                return tal_free(tmpctx);
+                return NULL;
 
         /* Need exact length here */
         hrpu8 = tal_dup_arr(tmpctx, u8, (const u8 *)hrp, strlen(hrp), 0);
         if (!sign(data, hrpu8, &rsig, arg))
-                return tal_free(tmpctx);
+                return NULL;
 
         secp256k1_ecdsa_recoverable_signature_serialize_compact(
                 secp256k1_ctx,
@@ -986,7 +985,6 @@ char *bolt11_encode_(const tal_t *ctx,
         if (!bech32_encode(output, hrp, data, tal_count(data), (size_t)-1))
                 output = tal_free(output);
 
-        tal_free(tmpctx);
         return output;
 }
 

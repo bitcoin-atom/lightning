@@ -138,7 +138,7 @@ static bool IsRFC4843(const struct wireaddr *addr)
     return IsIPv6(addr) && (GetByte(addr, 15) == 0x20 && GetByte(addr, 14) == 0x01 && GetByte(addr, 13) == 0x00 && (GetByte(addr, 12) & 0xF0) == 0x10);
 }
 
-static bool IsTor(const struct wireaddr *addr)
+static bool IsTor(const struct wireaddr *addr UNUSED)
 {
 	/* FIXME */
 	return false;
@@ -228,7 +228,7 @@ static bool get_local_sockname(struct lightningd *ld,
     return true;
 }
 
-/* Return an wireaddr without port filled in */
+/* Return a wireaddr without port filled in */
 static bool guess_one_address(struct lightningd *ld,
                               struct wireaddr *addr, u16 portnum,
                               enum wire_addr_type type)
@@ -272,12 +272,12 @@ static bool guess_one_address(struct lightningd *ld,
 
     if (!IsRoutable(addr)) {
         log_debug(ld->log, "Address %s is not routable",
-                  type_to_string(ltmp, struct wireaddr, addr));
+                  type_to_string(tmpctx, struct wireaddr, addr));
         return false;
     }
 
     log_debug(ld->log, "Public address %s",
-              type_to_string(ltmp, struct wireaddr, addr));
+              type_to_string(tmpctx, struct wireaddr, addr));
     return true;
 }
 

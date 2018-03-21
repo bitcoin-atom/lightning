@@ -1,6 +1,7 @@
 #ifndef LIGHTNING_LIGHTNINGD_JSONRPC_H
 #define LIGHTNING_LIGHTNINGD_JSONRPC_H
 #include "config.h"
+#include <bitcoin/chainparams.h>
 #include <ccan/autodata/autodata.h>
 #include <ccan/list/list.h>
 #include <common/json.h>
@@ -11,6 +12,8 @@ struct wireaddr;
 /* Context for a command (from JSON, but might outlive the connection!)
  * You can allocate off this for temporary objects. */
 struct command {
+	/* Off jcon->commands */
+	struct list_node list;
 	/* The global state */
 	struct lightningd *ld;
 	/* The 'id' which we need to include in the response. */
@@ -40,8 +43,8 @@ struct json_connection {
 	/* We've been told to stop. */
 	bool stop;
 
-	/* Current command. */
-	struct command *current;
+	/* Current commands. */
+	struct list_head commands;
 
 	struct list_head output;
 	const char *outbuf;
@@ -52,41 +55,51 @@ struct json_command {
 	void (*dispatch)(struct command *,
 			 const char *buffer, const jsmntok_t *params);
 	const char *description;
-	const char *help;
+	bool deprecated;
+	const char *verbose;
 };
+
+/* Get the parameters (by position or name).  Followed by triples of
+ * of const char *name, const jsmntok_t **ret_ptr, then NULL.
+ *
+ * If name starts with '?' it is optional (and will be set to NULL
+ * if it's a literal 'null' or not present).
+ * Otherwise false is returned, and command_fail already called.
+ */
+bool json_get_params(struct command *cmd,
+		     const char *buffer, const jsmntok_t param[], ...);
 
 struct json_result *null_response(const tal_t *ctx);
 void command_success(struct command *cmd, struct json_result *response);
 void PRINTF_FMT(2, 3) command_fail(struct command *cmd, const char *fmt, ...);
+void PRINTF_FMT(4, 5) command_fail_detailed(struct command *cmd,
+					     int code,
+					     const struct json_result *data,
+					     const char *fmt, ...);
 
 /* Mainly for documentation, that we plan to close this later. */
 void command_still_pending(struct command *cmd);
 
-/* '"fieldname" : "0289abcdef..."' or "0289abcdef..." if fieldname is NULL */
-void json_add_pubkey(struct json_result *response,
-		     const char *fieldname,
-		     const struct pubkey *key);
-
-/* '"fieldname" : <hexrev>' or "<hexrev>" if fieldname is NULL */
-void json_add_txid(struct json_result *result, const char *fieldname,
-		   const struct bitcoin_txid *txid);
-
-/* Extract a pubkey from this */
-bool json_tok_pubkey(const char *buffer, const jsmntok_t *tok,
-		     struct pubkey *pubkey);
-
-/* '"fieldname" : "1234:5:6"' */
-void json_add_short_channel_id(struct json_result *response,
-			       const char *fieldname,
-			       const struct short_channel_id *id);
-
-/* JSON serialize a network address for a node */
-void json_add_address(struct json_result *response, const char *fieldname,
-		      const struct wireaddr *addr);
-
 
 /* For initialization */
 void setup_jsonrpc(struct lightningd *ld, const char *rpc_filename);
+
+enum address_parse_result {
+	/* Not recognized as an onchain address */
+	ADDRESS_PARSE_UNRECOGNIZED,
+	/* Recognized as an onchain address, but targets wrong network */
+	ADDRESS_PARSE_WRONG_NETWORK,
+	/* Recognized and succeeds */
+	ADDRESS_PARSE_SUCCESS,
+};
+/* Return result of address parsing and fills in *scriptpubkey
+ * allocated off ctx if ADDRESS_PARSE_SUCCESS
+ */
+enum address_parse_result
+json_tok_address_scriptpubkey(const tal_t *ctx,
+			      const struct chainparams *chainparams,
+			      const char *buffer,
+			      const jsmntok_t *tok, const u8 **scriptpubkey);
 
 AUTODATA_TYPE(json_command, struct json_command);
 #endif /* LIGHTNING_LIGHTNINGD_JSONRPC_H */

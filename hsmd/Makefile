@@ -22,14 +22,17 @@ LIGHTNINGD_HSM_OBJS := $(LIGHTNINGD_HSM_SRC:.c=.o)
 HSMD_COMMON_OBJS :=				\
 	common/bip32.o				\
 	common/daemon_conn.o			\
-	common/debug.o				\
+	common/derive_basepoints.o		\
 	common/funding_tx.o			\
+	common/gen_status_wire.o		\
 	common/hash_u5.o			\
 	common/io_debug.o			\
 	common/key_derive.o			\
 	common/msg_queue.o			\
 	common/permute_tx.o			\
 	common/status.o				\
+	common/status_wire.o			\
+	common/subdaemon.o			\
 	common/type_to_string.o			\
 	common/utils.o				\
 	common/utxo.o				\

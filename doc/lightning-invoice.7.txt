@@ -8,7 +8,7 @@ lightning-invoice - Protocol for accepting payments.
 
 SYNOPSIS
 --------
-*invoice* 'msatoshi' 'label'
+*invoice* 'msatoshi' 'label' 'description' ['expiry']
 
 DESCRIPTION
 -----------
@@ -16,17 +16,30 @@ The *invoice* RPC command creates the expectation of a payment of a
 given amount of milli-satoshi: it returns a unique token which another
 lightning daemon can use to pay this invoice.
 
+The 'msatoshi' can be the string "any", which creates an invoice
+that can be paid with any amount.
+
 The 'label' must be unique; it is never revealed to other nodes on
 the lightning network, but it can be used to query the status of this
 invoice.
 
+The 'description' is a short description of purpose of payment,
+e.g. '1 cup of coffee'. This value is encoded into the BOLT11 invoice
+and is viewable by any node you send this invoice to.
+
+The 'expiry' is optionally the number of seconds the invoice is valid for.
+If no value is provided the default of 3600 (1 Hour) is used.
+
 RETURN VALUE
 ------------
 
-On success, a hash is returned as 'rhash' to be given to the payer.
+On success, a hash is returned as 'payment_hash' to be given to the payer,
+and the 'expiry_time' as a UNIX timestamp.
+It also returns a BOLT11 invoice as 'bolt11' to be given to the
+payer.
 On failure, an error is returned and no invoice is created.  If the
 lightning process fails before responding, the caller should use
-getinvoice(7) to query whether this invoice was created or not.
+lightning-listinvoice(7) to query whether this invoice was created or not.
 
 //FIXME:Enumerate errors
 

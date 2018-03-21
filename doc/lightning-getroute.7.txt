@@ -4,17 +4,18 @@ LIGHTNING-GETROUTE(7)
 
 NAME
 ----
-lightning-getroute - Protocol for routing a payment.
+lightning-getroute - Protocol for routing a payment (low-level).
 
 
 SYNOPSIS
 --------
-*getroute* 'id' 'msatoshi' 'riskfactor'
+*getroute* 'id' 'msatoshi' 'riskfactor' ['cltv'] ['fuzzpercent'] ['seed']
 
 DESCRIPTION
 -----------
 The *getroute* RPC command attempts to find the best route for the payment
-of 'msatoshi' to lightning node 'id'.
+of 'msatoshi' to lightning node 'id', such that the payment will arrive
+at 'id' with 'cltv'-blocks to spare (default 9).
 
 There are two considerations for how good a route is: how low the
 fees are, and how long your payment will get stuck if a node goes down
@@ -27,6 +28,19 @@ fail, and it would cost you 20% per annum if that happened,
 'riskfactor' would be 20.
 
 If you didn't care about risk, 'riskfactor' would be zero.
+
+The 'fuzzpercent' is a floating-point number, between 0.0 to 100.0,
+unit of percent.
+The 'fuzzpercent' is used to distort computed fees along each channel,
+to provide some randomization to the route generated.
+0.0 means the exact fee of that channel is used,
+while 100.0 means the fee used might be from 0 to twice the actual fee.
+The default is 5.0, or up to 5% fee distortion.
+
+The 'seed' is a string whose bytes are used to seed the RNG for
+the route randomization.
+If not specified, a random string is used.
+
 
 RISKFACTOR EFFECT ON ROUTING
 ----------------------------
@@ -101,8 +115,7 @@ Rusty Russell <rusty@rustcorp.com.au> is mainly responsible.
 
 SEE ALSO
 --------
-lightning-listinvoice(7), lightning-delinvoice(7),
-lightning-getroute(7), lightning-sendpay(7).
+lightning-pay(7), lightning-sendpay(7).
 
 RESOURCES
 ---------
